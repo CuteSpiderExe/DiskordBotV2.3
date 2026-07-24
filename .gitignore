@@ -1,0 +1,34 @@
+# Секреты
+.env
+
+# Виртуальное окружение и кэш
+venv/
+__pycache__/
+*.pyc
+
+# Сборка
+build/
+
+# Логи и рантайм-состояние (в т.ч. реальные переписки/heartbeat)
+*.log
+bot_log.txt
+debug_dev_log.txt
+heartbeat.txt
+memory.json
+
+# Тяжёлые веса F5-TTS (5+ГБ, скачиваются отдельно — см. README)
+f5_models/
+
+# Личные голосовые/видео-сэмплы для клонирования — не для публичного репо
+voice_ref.wav
+voice_ref.txt
+video.mp4
+video2.mp4
+audio_*.mp3
+audio_*.ogg
+
+# Windows
+desktop.ini
+
+# Claude Code (локальные настройки/разрешения)
+.claude/

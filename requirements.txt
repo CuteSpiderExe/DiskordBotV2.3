@@ -1,0 +1,15 @@
+py-cord[voice] @ git+https://github.com/Pycord-Development/pycord.git@fix/voice-rec-2
+PyNaCl>=1.5.0
+faster-whisper>=1.0.0
+webrtcvad-wheels>=2.0.10
+ollama>=0.3.0
+python-dotenv>=1.0.0
+omegaconf>=2.3.0
+silero>=0.4.1
+numpy>=1.24.0
+scipy
+
+# torch/torchaudio: сначала CUDA-сборка (нужна для F5-TTS), ставится ДО этого
+# файла отдельной командой — см. README:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+f5-tts
