@@ -53,6 +53,12 @@ def _clean_for_tts(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Модель обрывает волну на конце ровно там, где кончился текст — не на
+# нуле амплитуды, а посреди звука. Без затухания это слышно как резкий
+# щелчок/обрыв, будто фразу оборвали, а не как естественное окончание речи.
+_FADE_OUT_MS = 30
+
+
 def _to_stereo48k_int16(mono_float: np.ndarray, sample_rate: int) -> bytes:
     """Моно float [-1..1] на произвольной частоте -> формат, который ждёт
     Discord: 48kHz stereo 16-bit PCM."""
@@ -60,6 +66,10 @@ def _to_stereo48k_int16(mono_float: np.ndarray, sample_rate: int) -> bytes:
         t = torch.from_numpy(mono_float).unsqueeze(0)
         t = torchaudio.functional.resample(t, sample_rate, config.DISCORD_SAMPLE_RATE)
         mono_float = t.squeeze(0).numpy()
+    fade_len = min(len(mono_float), int(config.DISCORD_SAMPLE_RATE * _FADE_OUT_MS / 1000))
+    if fade_len > 0:
+        mono_float = mono_float.copy()
+        mono_float[-fade_len:] *= np.linspace(1.0, 0.0, fade_len, dtype=mono_float.dtype)
     mono_int16 = (mono_float * 32767.0).clip(-32768, 32767).astype(np.int16)
     stereo = np.repeat(mono_int16[:, None], 2, axis=1)  # дублируем канал: mono -> stereo
     return stereo.tobytes()
@@ -68,6 +78,7 @@ def _to_stereo48k_int16(mono_float: np.ndarray, sample_rate: int) -> bytes:
 if config.TTS_ENGINE == "f5":
     import f5_tts.infer.utils_infer as _f5_utils_infer
     from f5_tts.api import F5TTS
+    from ruaccent import RUAccent
 
     # Библиотека печатает ref_text/gen_text через голый print() внутри своего
     # модуля напрямую (не через параметр show_info=, который перекрывает
@@ -84,11 +95,33 @@ if config.TTS_ENGINE == "f5":
     )
     _f5_ref_text = Path(config.F5_REF_TEXT_FILE).read_text(encoding="utf-8").strip()
 
+    # У F5-TTS (в отличие от Silero) нет своей автоматической расстановки
+    # ударений — чекпоинт Misha24-10/F5-TTS_RUSSIAN понимает только явный "+"
+    # перед ударной гласной (см. его README) и без этого почти всегда ставит
+    # ударение наугад. RUAccent — ровно то, что для этого рекомендуют:
+    # ~5-9мс на фразу на прогретой модели, не влияет на задержку до первого
+    # слова на фоне самого синтеза (0.8-2с).
+    _accentizer = RUAccent()
+    _accentizer.load(omograph_model_size="turbo3.1", use_dictionary=True, tiny_mode=False)
+
+    def _accented(text: str) -> str:
+        # На неологизмах/сленге (которых у этого персонажа хватает — вроде
+        # "размьючиваться") внутренняя ONNX-модель RUAccent иногда падает
+        # с ValueError про token_type_ids (баг самой библиотеки на
+        # незнакомых словах). Ударения — это улучшение, а не обязательное
+        # условие речи: при сбое просто озвучиваем без расстановки, вместо
+        # того чтобы ронять всю фразу целиком.
+        try:
+            return _accentizer.process_all(text)
+        except Exception as e:
+            print(f"[tts] RUAccent не справился ({e!r}) — озвучиваю без ударений.")
+            return text
+
     def _synthesize(text: str) -> bytes:
         wav, sr, _ = _f5_model.infer(
             ref_file=config.F5_REF_AUDIO,
             ref_text=_f5_ref_text,
-            gen_text=text,
+            gen_text=_accented(text),
             speed=config.F5_SPEED,
             show_info=lambda *a, **k: None,  # иначе печатает ref_text/gen_text в лог на каждую фразу
             progress=None,  # иначе на каждую фразу лишний прогресс-бар в лог

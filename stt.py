@@ -1,5 +1,7 @@
 """STT-слой: faster-whisper, принимает аудио напрямую из памяти (numpy)."""
 
+import re
+
 import numpy as np
 from faster_whisper import WhisperModel
 
@@ -11,6 +13,20 @@ _model = WhisperModel(
     compute_type="int8",
     cpu_threads=config.WHISPER_CPU_THREADS,
 )
+
+# "Заученные" галлюцинации: Whisper видел эти фразы (титры фильмов/роликов)
+# тысячи раз в обучении и на тишине/шуме выдаёт их уверенно — no_speech_prob/
+# avg_logprob такое не ловят (модель не "сомневается", она реально помнит
+# именно этот текст). Список пополняется по мере того, что реально всплывает.
+_HALLUCINATION_RE = re.compile(
+    r"редактор субтитров|корректор [а-я]\.|субтитры создавал|"
+    r"продолжение следует|подписывайтесь на канал",
+    re.IGNORECASE,
+)
+# Одно и то же слово подряд 3+ раза — тоже типичный узор галлюцинации на
+# шуме, а не то, что говорят вслух; compression_ratio не всегда успевает
+# сработать на короткой фразе.
+_REPEATED_WORD_RE = re.compile(r"\b(\w+)\b(?:\s+\1\b){2,}", re.IGNORECASE)
 
 
 def transcribe_pcm16(pcm_bytes: bytes) -> str:
@@ -44,6 +60,8 @@ def transcribe_pcm16(pcm_bytes: bytes) -> str:
         if seg.no_speech_prob > 0.6 and seg.avg_logprob < -1.0:
             continue
         if seg.compression_ratio > 2.4:
+            continue
+        if _HALLUCINATION_RE.search(seg.text) or _REPEATED_WORD_RE.search(seg.text):
             continue
         parts.append(seg.text)
     return " ".join(parts).strip()

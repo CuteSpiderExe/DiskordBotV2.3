@@ -187,6 +187,9 @@ def ask(key: str, user_text: str, voice: bool = False, status: str = "", name: s
 # --- Стриминговый ответ, нарезанный на предложения — для голоса ---
 
 _SENTENCE_END = re.compile(r"([.!?…]+[\s\"»)]*)")
+# Реплики короче этого клеятся со следующим предложением перед синтезом —
+# см. комментарий в stream_sentences().
+_MIN_TTS_CHARS = 15
 
 
 def stream_sentences(
@@ -218,6 +221,14 @@ def stream_sentences(
             buffer = ""
             round_answer = ""
             tool_calls = []
+            # Очень короткие реплики ("Привет!", "Ха!", "Ну и?") сами по себе
+            # ставят F5-TTS в тупик: у неё есть спецкейс "меньше 10 байт —
+            # говори медленнее", но чуть более длинные короткие фразы под
+            # него не попадают и всё равно обсчитывают слишком узкий бюджет
+            # длительности — модель обрубает слово на середине (см. "Привет!"
+            # -> слышно только "При"). Копим такие обрывки и клеим со
+            # следующим предложением вместо того, чтобы озвучивать поодиночке.
+            pending = ""
             for chunk in stream:
                 msg = chunk.get("message", {})
                 calls = msg.get("tool_calls")
@@ -236,9 +247,15 @@ def stream_sentences(
                         break
                     sentence = _sanitize(buffer[: m.end()])
                     buffer = buffer[m.end() :]
-                    if sentence:
-                        yield sentence
+                    if not sentence:
+                        continue
+                    pending = f"{pending} {sentence}".strip() if pending else sentence
+                    if len(pending) >= _MIN_TTS_CHARS:
+                        yield pending
+                        pending = ""
             tail = _sanitize(buffer)
+            if pending:
+                tail = f"{pending} {tail}".strip() if tail else pending
             if tail:
                 yield tail
 
