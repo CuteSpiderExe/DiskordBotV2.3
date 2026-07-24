@@ -14,14 +14,27 @@ class _RawPCM(discord.AudioSource):
     """AudioSource поверх готового PCM 48kHz stereo 16-bit из памяти."""
 
     FRAME_BYTES = 3840  # 20мс * 48000Гц * 2 канала * 2 байта
+    # Обычно длина синтеза не кратна ровно 20мс — раньше последний неполный
+    # кусок (до 20мс реальной речи) просто отбрасывался целиком, обрезая
+    # конец фразы. Дополняем тишиной до полного фрейма вместо отбрасывания.
+    #
+    # В начале — известная особенность голосовых клиентов Discord: первые
+    # ~100-200мс звука после тишины в канале слушатели иногда не слышат,
+    # decoder/jitter-buffer ещё не успевает "проснуться" (это же периодически
+    # заметно и когда говорят реальные люди после паузы). Отдаём немного
+    # тишины перед настоящей речью, чтобы под удар попадала не она.
+    LEAD_SILENCE_MS = 120
 
     def __init__(self, pcm: bytes):
-        self._buf = io.BytesIO(pcm)
+        lead_silence = b"\x00" * int(48000 * 2 * 2 * self.LEAD_SILENCE_MS / 1000)
+        self._buf = io.BytesIO(lead_silence + pcm)
 
     def read(self) -> bytes:
         chunk = self._buf.read(self.FRAME_BYTES)
+        if not chunk:
+            return b""  # реальный конец потока
         if len(chunk) < self.FRAME_BYTES:
-            return b""  # конец
+            chunk += b"\x00" * (self.FRAME_BYTES - len(chunk))  # добиваем тишиной, не теряя хвост
         return chunk
 
     def is_opus(self) -> bool:

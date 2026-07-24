@@ -151,7 +151,24 @@ async def on_ready():
                 if channel != guild.afk_channel
                 and any(uid != bot.user.id for uid in channel.voice_states)
             ]
-            if len(occupied) == 1:
+            # os._exit(1) при аварийном перезапуске (см. on_dead в _make_sink)
+            # обрывает процесс без штатного disconnect() — Discord ещё не
+            # успел это заметить и продолжает показывать её "призраком" в
+            # канале, где она реально была. Новый процесс не в курсе этого
+            # (guild.voice_client тут всегда None — это же чистый процесс),
+            # но её собственный id всё ещё виден в voice_states ТОГО канала —
+            # это однозначный сигнал, куда возвращаться, даже если параллельно
+            # кто-то есть и в другом канале.
+            ghost_channel = next(
+                (c for c in guild.voice_channels if bot.user.id in c.voice_states), None
+            )
+            if ghost_channel is not None:
+                print(f"[voice] Висит призраком в {ghost_channel.name} после сбоя — переподключаюсь туда же.")
+                try:
+                    await _join_channel(guild, ghost_channel, announce=False)
+                except Exception as e:
+                    print(f"[voice] Не удалось переподключиться в {ghost_channel.name}: {e}")
+            elif len(occupied) == 1:
                 channel = occupied[0]
                 print(f"[voice] В {channel.name} уже кто-то есть — захожу сама.")
                 try:
@@ -161,9 +178,10 @@ async def on_ready():
                 except Exception as e:
                     print(f"[voice] Не удалось самостоятельно зайти в канал: {e}")
             elif len(occupied) > 1:
-                # Люди сидят сразу в нескольких каналах — непонятно, к кому
-                # идти, а угадывать (брать просто первый по списку) значит
-                # с той же вероятностью прийти не туда. Ждём явного ari!join.
+                # Люди сидят сразу в нескольких каналах, и её самой нигде нет
+                # (иначе сработала бы ветка выше) — непонятно, к кому идти, а
+                # угадывать (брать просто первый по списку) значит с той же
+                # вероятностью прийти не туда. Ждём явного ari!join.
                 names = ", ".join(c.name for c in occupied)
                 print(f"[voice] Люди сразу в нескольких каналах ({names}) — не угадываю, жду ari!join.")
 
