@@ -15,6 +15,7 @@ from xml.sax.saxutils import escape as _xml_escape
 import numpy as np
 import torch
 import torchaudio
+from num2words import num2words
 
 import config
 
@@ -44,12 +45,37 @@ _REPEAT_PUNCT_RE = re.compile(r"([!?])\1+")
 # Отсекаем такое здесь же, как и пустой текст.
 _HAS_LETTER_RE = re.compile(r"\w", re.UNICODE)
 
+# Ни Silero, ни F5 не превращают цифры в слова сами — голая "1" в тексте
+# читается моделью как попало (наблюдали: "1 минута" озвучилось как "Э
+# минута"). Склонение по падежам не учитываем (это уже сложнее и не стоит
+# того здесь) — род по следующему слову угадываем эвристикой, слово всё
+# равно понятнее голой цифры, даже если падеж не идеальный.
+_NUMBER_RE = re.compile(r"\d+")
+_FEMININE_UNIT_RE = re.compile(r"^(минут|секунд|недел|штук)", re.IGNORECASE)
+
+
+def _numbers_to_words(text: str) -> str:
+    def _repl(m: re.Match) -> str:
+        tail = text[m.end() : m.end() + 15].strip()
+        is_feminine = bool(_FEMININE_UNIT_RE.match(tail))
+        try:
+            # num2words падает с KeyError на gender=None — параметр либо
+            # опущен вовсе (маскулинная форма по умолчанию), либо строка.
+            if is_feminine:
+                return num2words(int(m.group()), lang="ru", gender="feminine")
+            return num2words(int(m.group()), lang="ru")
+        except Exception:
+            return m.group()
+
+    return _NUMBER_RE.sub(_repl, text)
+
 
 def _clean_for_tts(text: str) -> str:
     text = _EMOJI_RE.sub("", text)
     text = _MARKDOWN_RE.sub("", text)
     text = _ELLIPSIS_RE.sub(",", text)
     text = _REPEAT_PUNCT_RE.sub(r"\1", text)
+    text = _numbers_to_words(text)
     return re.sub(r"\s+", " ", text).strip()
 
 

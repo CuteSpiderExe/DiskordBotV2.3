@@ -14,3 +14,4 @@ scipy
 #   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
 f5-tts
 ruaccent
+num2words

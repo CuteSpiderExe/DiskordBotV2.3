@@ -179,7 +179,7 @@ def set_voice_channel_status(status: str) -> str:
     return f"Статус канала: «{status}»." if status else "Статус канала очищен."
 
 
-def mute_member(member_name: str, mute: bool = True) -> str:
+def mute_member(member_name: str, mute: bool = True, duration_sec: float = 60) -> str:
     """Замьютить или снять мьют с участника голосового канала, в котором ты
     сейчас находишься. Работает только для тех, кто прямо сейчас сидит в
     этом канале вместе с тобой. Если просят замьютить «меня»/«себя» —
@@ -189,6 +189,13 @@ def mute_member(member_name: str, mute: bool = True) -> str:
       member_name: Имя или ник участника (можно неполное совпадение), либо
         «себя»/«меня», если просьба про самого обращающегося.
       mute: True — замьютить, False — снять мьют.
+      duration_sec: Через сколько секунд снять мьют автоматически —бери
+        время ТОЛЬКО из текущей просьбы, не из своих же предыдущих вызовов
+        этого инструмента в истории разговора (даже если там звучало
+        конкретное число — это была другая просьба, к этой она отношения не
+        имеет). Если время не назвали именно сейчас — используй 60 (без
+        явной просьбы не больше минуты). Передай 0, только если явно
+        попросили бессрочно (без ограничения по времени вообще).
 
     Returns:
       str: результат действия.
@@ -206,6 +213,22 @@ def mute_member(member_name: str, mute: bool = True) -> str:
     member = _run(_do())
     if member is None:
         return f"Не нашла в канале участника «{member_name}»."
+
+    if mute and duration_sec > 0:
+        member_id = member.id
+        guild = ctx.guild
+
+        async def _auto_unmute():
+            await asyncio.sleep(duration_sec)
+            try:
+                m = guild.get_member(member_id) or await guild.fetch_member(member_id)
+                if m is not None and m.voice is not None and m.voice.mute:
+                    await m.edit(mute=False)
+            except Exception as e:
+                print(f"[tools] Не удалось автоматически снять мьют: {e!r}")
+
+        asyncio.run_coroutine_threadsafe(_auto_unmute(), ctx.loop)
+        return f"Замьютила {member.display_name} на {duration_sec:.0f} сек."
     return f"{'Замьютила' if mute else 'Сняла мьют с'} {member.display_name}."
 
 
