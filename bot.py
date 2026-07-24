@@ -138,26 +138,34 @@ async def on_ready():
         for guild in bot.guilds:
             if guild.voice_client is not None:
                 continue
-            for channel in guild.voice_channels:
-                if channel == guild.afk_channel:
-                    continue
-                # channel.members требует кэш участников сервера (Members
-                # Intent), которого у нас нет и не должно быть для такого
-                # бота — из-за этого сразу после (пере)запуска кэш почти
-                # пуст, и channel.members ложно выглядит пустым, даже если
-                # люди реально сидят в канале. channel.voice_states — низкий
-                # уровень специально для этого случая: строится из voice-
-                # состояний (voice_states intent, он есть), не из кэша
-                # участников.
-                if any(uid != bot.user.id for uid in channel.voice_states):
-                    print(f"[voice] В {channel.name} уже кто-то есть — захожу сама.")
-                    try:
-                        # Это (пере)запуск процесса, а не событие в разговоре —
-                        # никто её не звал, поэтому здесь всегда тихий вход.
-                        await _join_channel(guild, channel, announce=False)
-                    except Exception as e:
-                        print(f"[voice] Не удалось самостоятельно зайти в канал: {e}")
-                    break
+            # channel.members требует кэш участников сервера (Members Intent),
+            # которого у нас нет и не должно быть для такого бота — из-за
+            # этого сразу после (пере)запуска кэш почти пуст, и
+            # channel.members ложно выглядит пустым, даже если люди реально
+            # сидят в канале. channel.voice_states — низкий уровень специально
+            # для этого случая: строится из voice-состояний (voice_states
+            # intent, он есть), не из кэша участников.
+            occupied = [
+                channel
+                for channel in guild.voice_channels
+                if channel != guild.afk_channel
+                and any(uid != bot.user.id for uid in channel.voice_states)
+            ]
+            if len(occupied) == 1:
+                channel = occupied[0]
+                print(f"[voice] В {channel.name} уже кто-то есть — захожу сама.")
+                try:
+                    # Это (пере)запуск процесса, а не событие в разговоре —
+                    # никто её не звал, поэтому здесь всегда тихий вход.
+                    await _join_channel(guild, channel, announce=False)
+                except Exception as e:
+                    print(f"[voice] Не удалось самостоятельно зайти в канал: {e}")
+            elif len(occupied) > 1:
+                # Люди сидят сразу в нескольких каналах — непонятно, к кому
+                # идти, а угадывать (брать просто первый по списку) значит
+                # с той же вероятностью прийти не туда. Ждём явного ari!join.
+                names = ", ".join(c.name for c in occupied)
+                print(f"[voice] Люди сразу в нескольких каналах ({names}) — не угадываю, жду ari!join.")
 
 
 @bot.event
