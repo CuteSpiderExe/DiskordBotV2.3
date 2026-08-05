@@ -43,8 +43,18 @@ def transcribe_pcm16(pcm_bytes: bytes) -> str:
     # condition_on_previous_text=False — иначе одна галлюцинация на тишине
     # затравливает следующий сегмент внутри того же вызова, и модель начинает
     # уверенно "договаривать" её же текст дальше.
+    # word_timestamps + hallucination_silence_threshold — встроенный в саму
+    # faster-whisper механизм именно под этот класс галлюцинаций: если
+    # внутри куска есть подозрительно долгая тишина без слов, а модель
+    # всё равно что-то "услышала" по бокам от неё — считает это признаком
+    # галлюцинации и обрезает, а не просто доверяет тексту.
     segments, _ = _model.transcribe(
-        audio, language="ru", vad_filter=True, condition_on_previous_text=False
+        audio,
+        language="ru",
+        vad_filter=True,
+        condition_on_previous_text=False,
+        word_timestamps=True,
+        hallucination_silence_threshold=2.0,
     )
     parts = []
     for seg in segments:
