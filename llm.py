@@ -21,12 +21,24 @@ _NARRATION_RE = re.compile(
     re.IGNORECASE,
 )
 _QUOTE_CHARS_RE = re.compile(r'["\'«»“”]')
+_IDLE_TOOL_MARKER_RE = re.compile(
+    r"\(?\s*я\s+вызываю\s+(?:инструмент|функцию)\s*\)?|(?:\$?\{)?function_call\s*\(",
+    re.IGNORECASE,
+)
 
 
 def _sanitize(text: str) -> str:
     text = _NARRATION_RE.sub("", text)
     text = _QUOTE_CHARS_RE.sub("", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _sanitize_idle_chatter(text: str) -> str:
+    text = _sanitize(text)
+    marker = _IDLE_TOOL_MARKER_RE.search(text)
+    if marker:
+        text = text[: marker.start()].rstrip(" ,;:-")
+    return text or "М-да, тишина тут звенит громче музыки."
 
 # --- Персонаж ---
 
@@ -44,7 +56,11 @@ def _load_persona() -> str:
 PERSONA = _load_persona()
 VOICE_SUFFIX = (
     "\n\nВАЖНО: ответ будет озвучен голосом — пиши как для устной речи, без "
-    "markdown, эмодзи и списков. 1-3 коротких предложения."
+    "markdown, эмодзи и списков. На простой вопрос или короткую реплику отвечай "
+    "2-3 предложениями. Если вопрос сложный, просит объяснение или тема "
+    "действительно требует подробностей — дай полный ответ из 7-10 содержательных "
+    "предложений. Не растягивай простой ответ и не выбирай промежуточную длину "
+    "в 4-6 предложений только ради объёма."
 )
 # Без этого модель периодически просто ПИШЕТ, что выполнила действие (закрепила
 # сообщение, поставила статус), не вызывая инструмент по-настоящему — на
@@ -55,6 +71,20 @@ TOOLS_REMINDER = (
     "инструмент по-настоящему (tool call), а не просто написать в ответе, что "
     "сделала это. Без настоящего вызова действие не произойдёт на самом деле."
 )
+FOCUS_REMINDER = (
+    "\n\nДЕРЖИ ТЕМУ: сначала ответь прямо на последнее сообщение собеседника и "
+    "не уходи от его вопроса. Не начинай новую тему и не добавляй длинные "
+    "случайные отступления. Шутка или подкол допустимы только после ответа "
+    "и только если они не мешают смыслу. Если контекста не хватает, задай "
+    "один короткий уточняющий вопрос по той же теме."
+)
+FACTS_REMINDER = (
+    "\n\nТОЧНОСТЬ: не выдумывай факты, события, цитаты, источники, возможности "
+    "или результаты действий. Если не знаешь или не уверена — прямо скажи об "
+    "этом, не заполняй пробелы догадками. Чётко отделяй известное из контекста "
+    "от предположений; о текущих событиях не утверждай без доступной проверки. "
+    "Результат действия считай подтверждённым только после ответа инструмента."
+)
 
 
 def _opts(**extra) -> dict:
@@ -62,6 +92,9 @@ def _opts(**extra) -> dict:
         "num_thread": config.OLLAMA_NUM_THREAD,
         "num_ctx": config.OLLAMA_NUM_CTX,
         "num_predict": config.LLM_MAX_TOKENS,
+        "temperature": 0.35,
+        "top_p": 0.85,
+        "top_k": 40,
         # Абилитированная модель на коротком голосовом контексте склонна залипать
         # на одной и той же фразе из истории — сбиваем это репитейшн- и
         # presence-штрафами, а не только дефолтным repeat_penalty.
@@ -77,7 +110,7 @@ def _opts(**extra) -> dict:
 def _system_prompt(key: str, voice: bool, status: str = "", name: str = "") -> str:
     if name:
         memory.set_name(key, name)
-    system = PERSONA + (VOICE_SUFFIX if voice else "") + TOOLS_REMINDER
+    system = PERSONA + (VOICE_SUFFIX if voice else "") + TOOLS_REMINDER + FOCUS_REMINDER + FACTS_REMINDER
     summary = memory.entry(key)["summary"]
     if summary:
         system += f"\n\nЧто ты помнишь об этом собеседнике: {summary}"
@@ -134,7 +167,7 @@ def compress_history(key: str):
             messages=[{"role": "user", "content": prompt}],
             options=_opts(num_predict=200),
             keep_alive=config.OLLAMA_KEEP_ALIVE,
-            think=False,
+            think=config.LLM_THINK,
         )
         memory.add_summary(key, resp["message"]["content"].strip())
     except Exception as e:
@@ -157,9 +190,9 @@ def ask(key: str, user_text: str, voice: bool = False, status: str = "", name: s
             model=config.OLLAMA_MODEL,
             messages=messages,
             tools=discord_tools.TEXT_TOOLS,
-            options=_opts(temperature=0.9),
+            options=_opts(),
             keep_alive=config.OLLAMA_KEEP_ALIVE,
-            think=False,
+            think=config.LLM_THINK,
         )
         msg = response["message"]
         answer = (msg.get("content") or "").strip()
@@ -212,8 +245,11 @@ def stream_sentences(
                 model=config.OLLAMA_MODEL,
                 messages=messages,
                 tools=discord_tools.VOICE_TOOLS,
-                options=_opts(temperature=0.9),
+                options=_opts(),
                 keep_alive=config.OLLAMA_KEEP_ALIVE,
+                # В текущей версии Ollama streaming с think=True иногда
+                # отдаёт только скрытое рассуждение без финального текста;
+                # для голосового ответа нужен надёжный поток content.
                 think=False,
                 stream=True,
             )
@@ -292,7 +328,7 @@ def generate_greeting() -> str:
     resp = _client.chat(
         model=config.OLLAMA_MODEL,
         messages=messages,
-        options=_opts(temperature=1.0, num_predict=60),
+        options=_opts(temperature=0.7, num_predict=60),
         keep_alive=config.OLLAMA_KEEP_ALIVE,
         think=False,
     )
@@ -315,7 +351,7 @@ def generate_kick_complaint() -> str:
     resp = _client.chat(
         model=config.OLLAMA_MODEL,
         messages=messages,
-        options=_opts(temperature=1.1, num_predict=80),
+        options=_opts(temperature=0.8, num_predict=80),
         keep_alive=config.OLLAMA_KEEP_ALIVE,
         think=False,
     )
@@ -326,7 +362,14 @@ def generate_idle_chatter() -> str:
     """Спонтанная реплика, когда в канале давно никто не говорил (без памяти,
     как и приветствие — это не ответ конкретному человеку)."""
     messages = [
-        {"role": "system", "content": PERSONA + VOICE_SUFFIX},
+        {
+            "role": "system",
+            "content": PERSONA
+            + VOICE_SUFFIX
+            + "\n\nДля этой спонтанной реплики инструменты недоступны. Не вызывай и не "
+            "упоминай инструменты, не печатай function_call, JSON или код. "
+            "Выдай только одну короткую произносимую реплику.",
+        },
         {
             "role": "user",
             "content": "В голосовом канале уже какое-то время тишина — никто "
@@ -338,11 +381,11 @@ def generate_idle_chatter() -> str:
     resp = _client.chat(
         model=config.OLLAMA_MODEL,
         messages=messages,
-        options=_opts(temperature=1.1, num_predict=60),
+        options=_opts(temperature=0.7, num_predict=60),
         keep_alive=config.OLLAMA_KEEP_ALIVE,
         think=False,
     )
-    return resp["message"]["content"].strip()
+    return _sanitize_idle_chatter(resp["message"]["content"])
 
 
 def warmup():

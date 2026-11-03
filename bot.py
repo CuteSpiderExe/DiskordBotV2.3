@@ -151,14 +151,6 @@ async def on_ready():
                 if channel != guild.afk_channel
                 and any(uid != bot.user.id for uid in channel.voice_states)
             ]
-            # os._exit(1) при аварийном перезапуске (см. on_dead в _make_sink)
-            # обрывает процесс без штатного disconnect() — Discord ещё не
-            # успел это заметить и продолжает показывать её "призраком" в
-            # канале, где она реально была. Новый процесс не в курсе этого
-            # (guild.voice_client тут всегда None — это же чистый процесс),
-            # но её собственный id всё ещё виден в voice_states ТОГО канала —
-            # это однозначный сигнал, куда возвращаться, даже если параллельно
-            # кто-то есть и в другом канале.
             ghost_channel = next(
                 (c for c in guild.voice_channels if bot.user.id in c.voice_states), None
             )
@@ -232,9 +224,9 @@ async def _process_utterance(guild_id: int, uid: int, pcm16k: bytes):
         return
     print(f"[{time.strftime('%H:%M:%S')}] [user {uid}] {text}  (STT: {t1 - t0:.1f}с)")
 
-    # Отвечает только на прямое обращение по имени (WAKE_WORDS) — иначе любая
-    # фраза в канале (в том числе разговор не с ней) считалась бы вопросом.
-    if config.WAKE_WORD_RE is None or not config.WAKE_WORD_RE.search(text):
+    if config.REQUIRE_WAKE_WORD and (
+        config.WAKE_WORD_RE is None or not config.WAKE_WORD_RE.search(text)
+    ):
         print(f"[voice] Игнорирую (без обращения по имени): {text}")
         return
 
@@ -384,23 +376,7 @@ def _make_sink(guild: discord.Guild) -> VoiceSink:
         sp = speakers.get(guild_id)
         return sp.busy if sp else False
 
-    async def on_dead():
-        # Приём голоса молча умер целиком (см. VoiceSink.RECORDING_DEAD_TIMEOUT_SEC).
-        # Перепробовали и переинициализацию DAVE-сессии на месте, и полный
-        # disconnect()+connect() внутри того же процесса — оба способа за
-        # вечер несколько раз зависали на минуты без единой ошибки в логе
-        # (тот же класс багов, что play/stop в этой ветке py-cord), а иногда
-        # "успешно" завершались, не восстановив реальный приём. Единственное,
-        # что за вечер отработало каждый раз без исключений — полный
-        # перезапуск ПРОЦЕССА: restart-loop снаружи поднимает чистый bot.py,
-        # а тот на старте (on_ready) сам находит канал с людьми и заходит —
-        # это проверено множество раз и ни разу не подвело. Поэтому вместо
-        # попытки починить соединение внутри процесса просто убиваем его
-        # целиком и отдаём восстановление внешнему циклу перезапуска.
-        print("[voice] Приём голоса завис (нет пакетов) — перезапускаю процесс целиком.")
-        os._exit(1)
-
-    sink = VoiceSink(bot.loop, on_utt, bot_speaking, on_dead)
+    sink = VoiceSink(bot.loop, on_utt, bot_speaking)
     return sink
 
 
@@ -411,7 +387,7 @@ async def _join_channel(
     когда кто-то заходит в канал, и переподключением после кика.
 
     announce=False — тихий вход без реплики: используется, когда мы сами
-    переподключаемся из-за технического сбоя (см. on_dead в _make_sink) —
+    переподключаемся после технического сбоя процесса —
     это не событие в разговоре, никто её не звал и не выгонял, озвучивать
     нечего."""
     if guild.id in _joining_guilds:

@@ -53,7 +53,8 @@ OLLAMA_NUM_THREAD = int(os.getenv("OLLAMA_NUM_THREAD", "12"))
 # историей (SHORT_HISTORY_LEN) хватает несколько тысяч токенов с запасом.
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "150"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "220"))
+LLM_THINK = os.getenv("LLM_THINK", "true").lower() in {"1", "true", "yes", "on"}
 # Если Ollama не отвечает дольше этого — считаем запрос зависшим (сеть/GPU-память
 # и т.п.) и обрываем его, а не ждём вечно.
 OLLAMA_TIMEOUT_SEC = float(os.getenv("OLLAMA_TIMEOUT_SEC", "45"))
@@ -95,6 +96,7 @@ DISCORD_SAMPLE_RATE = 48000   # PCM, который отдаёт/принима�
 VAD_SAMPLE_RATE = 16000       # webrtcvad поддерживает 8/16/32/48 кГц; Whisper любит 16k
 FRAME_MS = 20
 SILENCE_LIMIT_SEC = float(os.getenv("SILENCE_LIMIT_SEC", "0.8"))
+REQUIRE_WAKE_WORD = os.getenv("REQUIRE_WAKE_WORD", "false").lower() in {"1", "true", "yes", "on"}
 # Пока бот говорит, чужая речь распознаётся как обычная фраза (без мгновенного
 # барж-ина по VAD) — перебивает её только если в распознанном тексте есть
 # одно из этих слов (обращение по имени). Через запятую, регистр не важен.
