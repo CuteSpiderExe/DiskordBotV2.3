@@ -1,0 +1,9 @@
+# Separate overlay environment sharing the existing Qwen environment's packages.
+# qwen-tts-hf replaces qwen-tts only inside the overlay, not the original env.
+# uv pip install --python qwen_tts_trial/faster_env/Scripts/python.exe --no-deps -r requirements-qwen-faster.txt
+faster-qwen3-tts==0.5.4
+qwen-tts-hf==0.1.1.post1
+transformers==5.15.1
+tokenizers==0.22.2
+huggingface-hub==1.33.0
+safetensors==0.8.0

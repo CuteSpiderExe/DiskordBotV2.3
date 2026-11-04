@@ -1,7 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('venv/Lib/site-packages/discord/bin', 'discord/bin')]
+datas = [('venv/Lib/site-packages/discord/bin', 'discord/bin'),
+         ('qwen_worker.py', '.'), ('voice_style.py', '.'), ('audio_pcm.py', '.')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('torch')

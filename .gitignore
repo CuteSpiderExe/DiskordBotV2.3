@@ -16,8 +16,6 @@ debug_dev_log.txt
 heartbeat.txt
 memory.json
 
-# Тяжёлые веса F5-TTS (5+ГБ, скачиваются отдельно — см. README)
-f5_models/
 
 # Личные голосовые/видео-сэмплы для клонирования — не для публичного репо.
 # Общий паттерн, а не только конкретные имена — таких файлов периодически
@@ -34,3 +32,7 @@ desktop.ini
 
 # Claude Code (локальные настройки/разрешения)
 .claude/
+
+
+# Isolated Qwen3-TTS voice comparison
+qwen_tts_trial/

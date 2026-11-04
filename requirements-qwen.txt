@@ -1,0 +1,5 @@
+# Install into a separate Python 3.12 environment, not the bot's venv.
+# pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0
+torchaudio==2.8.0
+qwen-tts==0.1.1

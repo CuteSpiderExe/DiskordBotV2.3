@@ -21,6 +21,7 @@ import difflib
 from dataclasses import dataclass
 
 import discord
+import request_control
 
 
 @dataclass
@@ -52,7 +53,15 @@ def _run(coro):
     asyncio.to_thread), а discord.py требует своего event loop — выполняем
     корутину в нём и синхронно ждём результат."""
     ctx = _current()
-    fut = asyncio.run_coroutine_threadsafe(coro, ctx.loop)
+    async def run_if_active():
+        try:
+            request_control.check()
+        except request_control.RequestCancelled:
+            coro.close()
+            raise
+        return await coro
+
+    fut = asyncio.run_coroutine_threadsafe(run_if_active(), ctx.loop)
     return fut.result(timeout=15)
 
 
