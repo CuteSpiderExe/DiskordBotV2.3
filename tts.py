@@ -1,11 +1,6 @@
-"""TTS-слой: два движка на выбор через config.TTS_ENGINE.
+"""Local Qwen CustomVoice or Silero -> Discord 48 kHz stereo PCM.
 
-f5     — F5-TTS с клонированным голосом (voice_ref.wav/.txt), GPU, живее.
-silero — старый движок (полностью локально, CPU), оставлен как быстрый
-         откат через .env, если f5 не устроит или GPU будет занят/недоступен.
-
-Единый интерфейс наружу — synthesize_pcm(text), всегда отдаёт сырой PCM
-48kHz stereo 16-bit (готовый для discord.PCMAudio), независимо от движка.
+Qwen runs persistently in its own environment to isolate its dependencies.
 """
 
 import re
@@ -13,11 +8,11 @@ from pathlib import Path
 from xml.sax.saxutils import escape as _xml_escape
 
 import numpy as np
-import torch
-import torchaudio
 from num2words import num2words
 
 import config
+from audio_pcm import stereo48k
+from voice_style import delivery, strip_tool_markup, strip_html_markup
 
 # Эмодзи и markdown-мусор, который иногда проскакивает из LLM: TTS их не
 # озвучивает осмысленно (тишина/спотыкание), поэтому чистим перед синтезом.
@@ -45,11 +40,8 @@ _REPEAT_PUNCT_RE = re.compile(r"([!?])\1+")
 # Отсекаем такое здесь же, как и пустой текст.
 _HAS_LETTER_RE = re.compile(r"\w", re.UNICODE)
 
-# Ни Silero, ни F5 не превращают цифры в слова сами — голая "1" в тексте
-# читается моделью как попало (наблюдали: "1 минута" озвучилось как "Э
-# минута"). Склонение по падежам не учитываем (это уже сложнее и не стоит
-# того здесь) — род по следующему слову угадываем эвристикой, слово всё
-# равно понятнее голой цифры, даже если падеж не идеальный.
+# Нормализуем числа для предсказуемого чтения; род единиц угадываем
+# по следующему слову, как и в прежнем синтезе.
 _NUMBER_RE = re.compile(r"\d+")
 _FEMININE_UNIT_RE = re.compile(r"^(минут|секунд|недел|штук)", re.IGNORECASE)
 
@@ -73,88 +65,25 @@ def _numbers_to_words(text: str) -> str:
 def _clean_for_tts(text: str) -> str:
     text = _EMOJI_RE.sub("", text)
     text = _MARKDOWN_RE.sub("", text)
-    text = _ELLIPSIS_RE.sub(",", text)
+    if config.TTS_ENGINE != "qwen":
+        text = _ELLIPSIS_RE.sub(",", text)
     text = _REPEAT_PUNCT_RE.sub(r"\1", text)
     text = _numbers_to_words(text)
     return re.sub(r"\s+", " ", text).strip()
 
 
-# Модель обрывает волну на конце ровно там, где кончился текст — не на
-# нуле амплитуды, а посреди звука. Без затухания это слышно как резкий
-# щелчок/обрыв, будто фразу оборвали, а не как естественное окончание речи.
-_FADE_OUT_MS = 30
-
-
 def _to_stereo48k_int16(mono_float: np.ndarray, sample_rate: int) -> bytes:
-    """Моно float [-1..1] на произвольной частоте -> формат, который ждёт
-    Discord: 48kHz stereo 16-bit PCM."""
-    if sample_rate != config.DISCORD_SAMPLE_RATE:
-        t = torch.from_numpy(mono_float).unsqueeze(0)
-        t = torchaudio.functional.resample(t, sample_rate, config.DISCORD_SAMPLE_RATE)
-        mono_float = t.squeeze(0).numpy()
-    fade_len = min(len(mono_float), int(config.DISCORD_SAMPLE_RATE * _FADE_OUT_MS / 1000))
-    if fade_len > 0:
-        mono_float = mono_float.copy()
-        mono_float[-fade_len:] *= np.linspace(1.0, 0.0, fade_len, dtype=mono_float.dtype)
-    mono_int16 = (mono_float * 32767.0).clip(-32768, 32767).astype(np.int16)
-    stereo = np.repeat(mono_int16[:, None], 2, axis=1)  # дублируем канал: mono -> stereo
-    return stereo.tobytes()
+    return stereo48k(mono_float, sample_rate)
 
 
-if config.TTS_ENGINE == "f5":
-    import f5_tts.infer.utils_infer as _f5_utils_infer
-    from f5_tts.api import F5TTS
-    from ruaccent import RUAccent
+if config.TTS_ENGINE == "qwen":
+    from qwen_backend import backend
 
-    # Библиотека печатает ref_text/gen_text через голый print() внутри своего
-    # модуля напрямую (не через параметр show_info=, который перекрывает
-    # только остальные её сообщения) — те две строки лога только загромождали
-    # бы bot.log на каждую фразу. Глушим точечно: подменяем print только в
-    # неймспейсе этого модуля, на остальной процесс не влияет.
-    _f5_utils_infer.print = lambda *a, **k: None
+    def _synthesize(text: str, style: str = "normal") -> bytes:
+        return backend.synthesize(text, style)
 
-    _f5_model = F5TTS(
-        model="F5TTS_v1_Base",
-        ckpt_file=config.F5_CKPT_FILE,
-        vocab_file=config.F5_VOCAB_FILE,
-        device="cuda",
-    )
-    _f5_ref_text = Path(config.F5_REF_TEXT_FILE).read_text(encoding="utf-8").strip()
-
-    # У F5-TTS (в отличие от Silero) нет своей автоматической расстановки
-    # ударений — чекпоинт Misha24-10/F5-TTS_RUSSIAN понимает только явный "+"
-    # перед ударной гласной (см. его README) и без этого почти всегда ставит
-    # ударение наугад. RUAccent — ровно то, что для этого рекомендуют:
-    # ~5-9мс на фразу на прогретой модели, не влияет на задержку до первого
-    # слова на фоне самого синтеза (0.8-2с).
-    _accentizer = RUAccent()
-    _accentizer.load(omograph_model_size="turbo3.1", use_dictionary=True, tiny_mode=False)
-
-    def _accented(text: str) -> str:
-        # На неологизмах/сленге (которых у этого персонажа хватает — вроде
-        # "размьючиваться") внутренняя ONNX-модель RUAccent иногда падает
-        # с ValueError про token_type_ids (баг самой библиотеки на
-        # незнакомых словах). Ударения — это улучшение, а не обязательное
-        # условие речи: при сбое просто озвучиваем без расстановки, вместо
-        # того чтобы ронять всю фразу целиком.
-        try:
-            return _accentizer.process_all(text)
-        except Exception as e:
-            print(f"[tts] RUAccent не справился ({e!r}) — озвучиваю без ударений.")
-            return text
-
-    def _synthesize(text: str) -> bytes:
-        wav, sr, _ = _f5_model.infer(
-            ref_file=config.F5_REF_AUDIO,
-            ref_text=_f5_ref_text,
-            gen_text=_accented(text),
-            speed=config.F5_SPEED,
-            show_info=lambda *a, **k: None,  # иначе печатает ref_text/gen_text в лог на каждую фразу
-            progress=None,  # иначе на каждую фразу лишний прогресс-бар в лог
-        )
-        return _to_stereo48k_int16(wav, sr)
-
-else:
+elif config.TTS_ENGINE == "silero":
+    import torch
     torch.set_num_threads(config.SILERO_CPU_THREADS)
     from silero import silero_tts
 
@@ -175,7 +104,7 @@ else:
         body = _PAUSE_RE.sub(_repl, _xml_escape(text))
         return f"<speak><p>{body}</p></speak>"
 
-    def _synthesize(text: str) -> bytes:
+    def _synthesize(text: str, style: str = "normal") -> bytes:
         audio = _silero_model.apply_tts(
             ssml_text=_to_ssml(text),
             speaker=config.SILERO_SPEAKER,
@@ -184,9 +113,22 @@ else:
         return _to_stereo48k_int16(audio.numpy(), config.SILERO_SAMPLE_RATE)
 
 
+else:
+    raise ValueError(f"Unknown TTS_ENGINE: {config.TTS_ENGINE}")
+
+
+def warmup():
+    if config.TTS_ENGINE == "qwen":
+        backend.warmup()
+
+
 def synthesize_pcm(text: str) -> bytes:
     """Текст -> сырой PCM 48kHz stereo 16-bit (готовый для discord.PCMAudio)."""
+    text, style = delivery(strip_tool_markup(strip_html_markup(text)))
+    if isinstance(style, dict):
+        style = {"segments": [{**part, "text": _clean_for_tts(part["text"])}
+                              for part in style["segments"]]}
     text = _clean_for_tts(text)
     if not text or not _HAS_LETTER_RE.search(text):
         return b""
-    return _synthesize(text)
+    return _synthesize(text, style)

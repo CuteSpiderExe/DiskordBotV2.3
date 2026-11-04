@@ -5,20 +5,20 @@
   memory.py     — персистентная память о собеседниках
   llm.py        — Ollama (стриминг, персонаж, сжатие истории)
   stt.py        — faster-whisper (распознавание из памяти)
-  tts.py        — Silero (синтез в PCM без ffmpeg)
+  tts.py        — Qwen CustomVoice / Silero (PCM без ffmpeg)
   speaker.py    — очередь воспроизведения
   voice_sink.py — приём голоса, VAD, детекция фраз
 
 Поток голосового ответа:
-  голос -> VAD -> фраза -> Whisper -> Ollama (stream) -> предложения ->
-  очередь Silero -> Discord (говорит первое предложение, пока генерируются
-  следующие). Пока бот говорит, входящий звук не обрабатывается (полный
+  голос -> VAD -> фраза -> Whisper -> полный ответ Ollama ->
+  единый синтез TTS -> Discord. Пока бот говорит, входящий звук не обрабатывается (полный
   дуплекс ломает расшифровку DAVE в этой ветке py-cord) — барж-ина нет.
 """
 
 import asyncio
 import logging
 import os
+import re
 import time
 
 import discord
@@ -27,7 +27,9 @@ from discord.ext import commands
 import config
 import discord_tools
 import llm
+import request_control
 import stt
+import tts
 from speaker import Speaker
 from voice_sink import VoiceSink
 
@@ -49,6 +51,8 @@ voice_sessions: dict[int, bool] = {}
 utterance_locks: dict[int, asyncio.Lock] = {}
 # guild_id -> когда последний раз кто-то (пользователь или бот) говорил
 last_activity: dict[int, float] = {}
+last_human_activity: dict[int, float] = {}
+last_idle_song: dict[int, float] = {}
 # guild_id -> фоновая задача, которая болтает, если в канале долго тишина
 idle_tasks: dict[int, asyncio.Task] = {}
 # guild_id-и, для которых прямо сейчас идёт подключение (защита от гонки
@@ -124,11 +128,12 @@ async def on_ready():
         asyncio.create_task(_heartbeat_writer())
 
         async def _warmup():
-            try:
-                await asyncio.to_thread(llm.warmup)
-                print("[llm] Модель прогрета, готова к запросам.")
-            except Exception as e:
-                print(f"[llm] Не удалось прогреть модель: {e}")
+            for label, warmup in (("tts", tts.warmup), ("llm", llm.warmup)):
+                try:
+                    await asyncio.to_thread(warmup)
+                    print(f"[{label}] Модель прогрета, готова к запросам.")
+                except Exception as e:
+                    print(f"[{label}] Не удалось прогреть модель: {e}")
 
         asyncio.create_task(_warmup())
 
@@ -213,6 +218,15 @@ async def on_message(message: discord.Message):
 pending_utterances: dict[int, dict[int, bytes]] = {}
 
 
+def _is_singing_request(text: str) -> bool:
+    # Explicit requests only; don't treat mentions of singing as a command.
+    if re.search(r"\b(?:не|нельзя|перестань|хватит)\s+(?:\w+\s+){0,2}(?:пой|спой|напой|петь|спеть|напеть)\b", text, re.I):
+        return False
+    return bool(re.search(
+        r"\b(?:спой|напой)\b|\b(?:можешь|можете|давай|прошу|хочу)\b"
+        r"[^.!?]{0,60}\b(?:спеть|напеть|петь|песенку|песню)\b", text, re.I))
+
+
 async def _process_utterance(guild_id: int, uid: int, pcm16k: bytes):
     speaker = speakers.get(guild_id)
     if speaker is None:
@@ -231,6 +245,24 @@ async def _process_utterance(guild_id: int, uid: int, pcm16k: bytes):
         return
 
     guild = bot.get_guild(guild_id)
+    # Принятый новый вопрос заменяет устаревшую озвучку, включая синтез.
+    await speaker.interrupt()
+    if _is_singing_request(text):
+        if config.TTS_ENGINE != "qwen":
+            await speaker.say("Напевная подача доступна с голосом Qwen.")
+            return
+        activity = last_human_activity.get(guild_id)
+        line = await asyncio.to_thread(llm.generate_idle_chatter, singing=True)
+        request_control.check()
+        if (speakers.get(guild_id) is speaker and speaker.vc.is_connected()
+                and last_human_activity.get(guild_id) == activity
+                and not pending_utterances.get(guild_id)):
+            print(f"[song voice] {line}")
+            await speaker.say(line)
+            last_idle_song[guild_id] = time.monotonic()
+        else:
+            print("[song discarded] Во время подготовки появилась новая активность.")
+        return
     member = guild.get_member(uid) if guild else None
     if member is None and guild is not None:
         # Без Members Intent (сознательно не запрошен) кэш участников почти
@@ -250,17 +282,17 @@ async def _process_utterance(guild_id: int, uid: int, pcm16k: bytes):
     )
 
     def _stream_worker():
-        """Крутится в отдельном потоке: тянет предложения из LLM-стрима
-        и сразу кидает их в очередь озвучки."""
-        first_at = None
+        """Собирает ответ целиком; TTS получает один текст после конца стрима."""
         full = []
         for sentence in llm.stream_sentences(str(uid), text, status, name):
-            if first_at is None:
-                first_at = time.monotonic()
-                print(f"[timing] Первое предложение LLM: {first_at - t1:.1f}с")
+            request_control.check()
             full.append(sentence)
-            speaker.say_threadsafe(sentence)
-        print(f"[{time.strftime('%H:%M:%S')}] [bot] {' '.join(full)}")
+        request_control.check()
+        answer = ' '.join(full).strip()
+        if answer:
+            print(f"[timing] Полный ответ LLM: {time.monotonic() - t1:.1f}с")
+            print(f"[{time.strftime('%H:%M:%S')}] [bot] {answer}")
+            speaker.say_threadsafe(answer)
 
     await asyncio.to_thread(_stream_worker)
 
@@ -270,6 +302,7 @@ async def handle_utterance(guild_id: int, uid: int, pcm16k: bytes):
     if speaker is None:
         return
     _touch_activity(guild_id)
+    last_human_activity[guild_id] = time.monotonic()
 
     # Сериализация: пока не обработана предыдущая фраза (STT+LLM-стрим),
     # следующую не начинаем — иначе конкурентные stream_sentences() гонятся
@@ -298,14 +331,26 @@ async def _process_utterance_safe(guild_id: int, uid: int, pcm16k: bytes):
     """Обёртка с таймаутом: если STT или Ollama зависнут (сеть, нехватка
     VRAM и т.п.) без исключения, лок на гильдию иначе не освободится никогда
     и бот молча перестанет отвечать до перезапуска."""
+    request = request_control.Request()
+    token = request_control.current.set(request)
     try:
         await asyncio.wait_for(
             _process_utterance(guild_id, uid, pcm16k), timeout=config.OLLAMA_TIMEOUT_SEC + 15
         )
     except asyncio.TimeoutError:
+        request.cancel()
+        speaker = speakers.get(guild_id)
+        if speaker:
+            await speaker.interrupt()
         print(f"[voice] Обработка фразы зависла (>{config.OLLAMA_TIMEOUT_SEC + 15:.0f}с), пропускаю.")
     except Exception as e:
+        request.cancel()
         print(f"[voice] Ошибка обработки фразы: {e!r}")
+    except asyncio.CancelledError:
+        request.cancel()
+        raise
+    finally:
+        request_control.current.reset(token)
 
 
 async def idle_watcher(guild: discord.Guild):
@@ -323,8 +368,11 @@ async def idle_watcher(guild: discord.Guild):
         listeners = [uid for uid in vc.channel.voice_states if uid != bot.user.id]
         if not listeners:
             continue
-        idle_for = time.monotonic() - last_activity.get(guild_id, time.monotonic())
-        if idle_for < config.IDLE_CHATTER_SEC:
+        now = time.monotonic()
+        human_at = last_human_activity.get(guild_id, now)
+        singing = now - max(human_at, last_idle_song.get(guild_id, human_at)) >= config.IDLE_SONG_SEC
+        idle_for = now - last_activity.get(guild_id, now)
+        if not singing and idle_for < config.IDLE_CHATTER_SEC:
             continue
 
         # Та же серилизация, что и у обычных фраз: нельзя гонять два запроса
@@ -333,12 +381,25 @@ async def idle_watcher(guild: discord.Guild):
         if lock.locked():
             continue
         try:
+            activity = last_activity.get(guild_id)
             async with lock:
-                line = await asyncio.to_thread(llm.generate_idle_chatter)
-            print(f"[idle chatter] {line}")
-            await speaker.say(line)
+                line = await asyncio.to_thread(llm.generate_idle_chatter, singing=singing)
+                if (last_activity.get(guild_id) != activity or speaker.busy
+                        or pending_utterances.get(guild_id)
+                        or not voice_sessions.get(guild_id)):
+                    print("[idle discarded] Во время генерации появилась активность.")
+                else:
+                    print(f"[idle chatter] {line}")
+                    await speaker.say(line)
+                    if singing:
+                        last_idle_song[guild_id] = time.monotonic()
         except Exception as e:
             print(f"[voice] Не удалось сгенерировать спонтанную фразу: {e}")
+        # Фраза, пришедшая под локом генерации idle, сама уже вернулась
+        # из handle_utterance. После освобождения лока обязательно запускаем её.
+        pending = pending_utterances.pop(guild_id, {})
+        for uid, pcm in pending.items():
+            await handle_utterance(guild_id, uid, pcm)
         _touch_activity(guild_id)
 
 
@@ -374,7 +435,7 @@ def _make_sink(guild: discord.Guild) -> VoiceSink:
 
     def bot_speaking() -> bool:
         sp = speakers.get(guild_id)
-        return sp.busy if sp else False
+        return sp.speaking if sp else False
 
     sink = VoiceSink(bot.loop, on_utt, bot_speaking)
     return sink
@@ -441,6 +502,8 @@ async def _join_channel(
             vc.start_recording, _make_sink(guild), make_after_recording(guild), label="start_recording"
         )
         _touch_activity(guild.id)
+        last_human_activity[guild.id] = time.monotonic()
+        last_idle_song.pop(guild.id, None)
 
         old_idle = idle_tasks.pop(guild.id, None)
         if old_idle:
@@ -526,18 +589,70 @@ async def leave_cmd(ctx: commands.Context):
     await ctx.send("Отключился.")
 
 
+@bot.command(name="sing", aliases=["пой"])
+async def sing_cmd(ctx: commands.Context):
+    """Сочинить и напеть короткую песенку в текущем голосовом канале."""
+    if ctx.guild is None:
+        await ctx.send("Команда работает в чате сервера.")
+        return
+    guild_id = ctx.guild.id
+    speaker = speakers.get(guild_id)
+    if speaker is None or not speaker.vc.is_connected():
+        await ctx.send("Сначала позови меня в голосовой канал: ari!join.")
+        return
+    if config.TTS_ENGINE != "qwen":
+        await ctx.send("Напевная подача доступна с голосом Qwen.")
+        return
+    lock = utterance_locks.setdefault(guild_id, asyncio.Lock())
+    if lock.locked() or speaker.busy:
+        await ctx.send("Сейчас отвечаю. Попроси спеть, когда закончу.")
+        return
+    _touch_activity(guild_id)
+    last_human_activity[guild_id] = time.monotonic()
+    activity = last_activity[guild_id]
+    try:
+        async with lock:
+            await ctx.send("Сочиняю песенку…")
+            line = await asyncio.to_thread(llm.generate_idle_chatter, singing=True)
+            if (speakers.get(guild_id) is not speaker or not speaker.vc.is_connected()
+                    or last_activity.get(guild_id) != activity
+                    or pending_utterances.get(guild_id)):
+                await ctx.send("Песенку отложила: начался разговор или изменилось подключение.")
+                return
+            print(f"[song command] {line}")
+            await speaker.say(line)
+            last_idle_song[guild_id] = time.monotonic()
+            _touch_activity(guild_id)
+    except Exception as exc:
+        print(f"[song command] Ошибка: {exc!r}")
+        await ctx.send("Не удалось подготовить песенку. Подробности в логе.")
+    finally:
+        pending = pending_utterances.pop(guild_id, {})
+        for uid, pcm in pending.items():
+            await handle_utterance(guild_id, uid, pcm)
+
+
 @bot.command(name="voice")
 async def voice_cmd(ctx: commands.Context, speaker_name: str = None):
-    """Показать или сменить голос Silero: ari!voice xenia / baya / kseniya (только женские)"""
+    """Показать или сменить голос активного движка."""
+    if config.TTS_ENGINE == "qwen":
+        valid = {v.lower(): v for v in ("Ono_Anna", "Vivian", "Serena", "Sohee")}
+        if speaker_name is None:
+            await ctx.send(f"Текущий голос: **{config.QWEN_SPEAKER}** (Qwen). Доступны: {', '.join(valid.values())}")
+        elif speaker_name.lower() in valid:
+            config.QWEN_SPEAKER = valid[speaker_name.lower()]
+            await ctx.send(f"Голос сменён на **{config.QWEN_SPEAKER}**.")
+        else:
+            await ctx.send(f"Доступны: {', '.join(valid.values())}")
+        return
     valid = ("xenia", "baya", "kseniya")
     if speaker_name is None:
         await ctx.send(f"Текущий голос: **{config.SILERO_SPEAKER}**. Доступны: {', '.join(valid)}")
-        return
-    if speaker_name not in valid:
-        await ctx.send(f"Не знаю такой голос. Доступны: {', '.join(valid)}")
-        return
-    config.SILERO_SPEAKER = speaker_name
-    await ctx.send(f"Голос сменён на **{speaker_name}**.")
+    elif speaker_name in valid:
+        config.SILERO_SPEAKER = speaker_name
+        await ctx.send(f"Голос сменён на **{speaker_name}**.")
+    else:
+        await ctx.send(f"Доступны: {', '.join(valid)}")
 
 
 @bot.command(name="model")

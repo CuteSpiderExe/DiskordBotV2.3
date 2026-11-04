@@ -9,9 +9,6 @@ silero>=0.4.1
 numpy>=1.24.0
 scipy
 
-# torch/torchaudio: сначала CUDA-сборка (нужна для F5-TTS), ставится ДО этого
-# файла отдельной командой — см. README:
-#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
-f5-tts
-ruaccent
+# Qwen runs in its separate environment; see requirements-qwen.txt and README.
+# Silero fallback needs torch in the bot environment.
 num2words

@@ -4,10 +4,12 @@
 
 import asyncio
 import io
+import time
 
 import discord
 
 import tts
+import request_control
 
 
 class _RawPCM(discord.AudioSource):
@@ -58,6 +60,9 @@ class Speaker:
         self.loop = loop
         self.queue: asyncio.Queue = asyncio.Queue()
         self.speaking = False
+        self._epoch = 0
+        self._synthesizing = 0
+        self._tts_requests = set()
         # Пока играет текущая фраза, здесь уже синтезируется следующая (если
         # её текст уже готов) — без этого между фразами возникала пауза
         # ~1-2с (время синтеза), даже когда LLM обгоняла TTS и текст был
@@ -67,13 +72,20 @@ class Speaker:
 
     @property
     def busy(self) -> bool:
-        return self.speaking or not self.queue.empty()
+        return self.speaking or self._synthesizing > 0 or not self.queue.empty()
 
     async def say(self, sentence: str):
         await self.queue.put(sentence)
 
     def say_threadsafe(self, sentence: str):
-        asyncio.run_coroutine_threadsafe(self.queue.put(sentence), self.loop)
+        request = request_control.current.get()
+        epoch = self._epoch
+
+        async def enqueue():
+            if epoch == self._epoch and (request is None or not request.cancelled.is_set()):
+                await self.queue.put(sentence)
+
+        asyncio.run_coroutine_threadsafe(enqueue(), self.loop)
 
     async def interrupt(self):
         """Барж-ин: очистить очередь и оборвать текущее воспроизведение.
@@ -83,15 +95,17 @@ class Speaker:
         из корутины, он тогда блокирует ВЕСЬ event loop бота целиком, а не
         только голос. Уносим его в отдельный поток и ограничиваем таймаутом,
         чтобы зависший stop() не парализовал бота полностью."""
+        self._epoch += 1
+        for request in tuple(self._tts_requests):
+            request.cancel()
         while not self.queue.empty():
             try:
                 self.queue.get_nowait()
                 self.queue.task_done()
             except asyncio.QueueEmpty:
                 break
-        if self._prefetch_task is not None:
-            self._prefetch_task.cancel()
-            self._prefetch_task = None
+        # Сохраняем задачу до получения результата: отмена asyncio.to_thread
+        # сама по себе не останавливает Python-поток.
         if self.vc.is_playing():
             try:
                 await asyncio.wait_for(asyncio.to_thread(self.vc.stop), timeout=5.0)
@@ -102,20 +116,37 @@ class Speaker:
         await self.interrupt()
         self._worker_task.cancel()
 
-    async def _synthesize(self, sentence: str) -> bytes:
+    async def _synthesize(self, sentence: str, epoch=None) -> bytes:
+        if epoch is not None and epoch != self._epoch:
+            self.queue.task_done()
+            return b""
+        self._synthesizing += 1
+        request = request_control.Request()
+        self._tts_requests.add(request)
+        token = request_control.current.set(request)
+        started = time.monotonic()
+        print(f"[tts start] {sentence}")
         try:
-            return await asyncio.to_thread(tts.synthesize_pcm, sentence)
+            pcm = await asyncio.to_thread(tts.synthesize_pcm, sentence)
+            print(f"[tts ready] {time.monotonic() - started:.1f}s; audio={len(pcm) / 192000:.1f}s; {sentence}")
+            return pcm
         finally:
+            request_control.current.reset(token)
+            self._tts_requests.discard(request)
+            self._synthesizing -= 1
             self.queue.task_done()
 
     async def _worker(self):
         while True:
+            epoch = self._epoch
             try:
                 if self._prefetch_task is not None:
                     # Уже начали синтезировать эту фразу заранее, пока играла
                     # предыдущая (см. конец цикла) — просто дожидаемся
                     # результата, без новой паузы на синтез между фразами.
                     task = self._prefetch_task
+                    sentence = self._prefetch_sentence
+                    epoch = self._prefetch_epoch
                     self._prefetch_task = None
                     try:
                         pcm = await task
@@ -123,7 +154,11 @@ class Speaker:
                         continue  # оборвано барж-ином (interrupt()) — просто пропускаем
                 else:
                     sentence = await self.queue.get()
+                    epoch = self._epoch
                     pcm = await self._synthesize(sentence)
+            except request_control.RequestCancelled:
+                print("[tts cancelled] Устаревший синтез остановлен.")
+                continue
             except Exception as e:
                 # Раньше эта часть была вне try/except: любая ошибка синтеза
                 # (например, из RUAccent или F5-TTS) тихо убивала весь
@@ -135,6 +170,12 @@ class Speaker:
                 continue
 
             try:
+                if epoch != self._epoch:
+                    print(f"[voice discarded] {sentence}")
+                    continue
+                if not pcm:
+                    print(f"[voice empty] {sentence}")
+                    continue
                 if not self.vc.is_connected():
                     continue
                 done = asyncio.Event()
@@ -145,6 +186,7 @@ class Speaker:
                     self.loop.call_soon_threadsafe(_done.set)
 
                 self.speaking = True
+                print(f"[play start] {sentence}")
                 # vc.play(), как и vc.stop() (см. interrupt()), в этой ветке
                 # py-cord иногда зависает насмерть — уносим в поток с
                 # таймаутом, чтобы не заморозить весь event loop бота.
@@ -164,9 +206,17 @@ class Speaker:
                 except asyncio.QueueEmpty:
                     next_sentence = None
                 if next_sentence is not None:
-                    self._prefetch_task = asyncio.create_task(self._synthesize(next_sentence))
+                    self._prefetch_sentence = next_sentence
+                    self._prefetch_epoch = epoch
+                    self._prefetch_task = asyncio.create_task(self._synthesize(next_sentence, epoch))
 
-                await done.wait()
+                duration = len(pcm) / (48000 * 2 * 2)
+                try:
+                    await asyncio.wait_for(done.wait(), timeout=duration + 10.0)
+                    print(f"[play finished] {sentence}")
+                except asyncio.TimeoutError:
+                    print("[speaker] Нет сигнала завершения воспроизведения — останавливаю фразу.")
+                    await asyncio.wait_for(asyncio.to_thread(self.vc.stop), timeout=5.0)
             except Exception as e:
                 print(f"[speaker] Ошибка синтеза/воспроизведения: {e!r}")
             finally:
