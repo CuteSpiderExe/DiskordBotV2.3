@@ -12,7 +12,7 @@ from num2words import num2words
 
 import config
 from audio_pcm import stereo48k
-from voice_style import delivery, strip_tool_markup, strip_html_markup
+from voice_style import delivery, strip_tool_markup, strip_html_markup, speech_language, japanese_only
 
 # Эмодзи и markdown-мусор, который иногда проскакивает из LLM: TTS их не
 # озвучивает осмысленно (тишина/спотыкание), поэтому чистим перед синтезом.
@@ -47,6 +47,8 @@ _FEMININE_UNIT_RE = re.compile(r"^(минут|секунд|недел|штук)"
 
 
 def _numbers_to_words(text: str) -> str:
+    if speech_language(text) == "Japanese":
+        return text
     def _repl(m: re.Match) -> str:
         tail = text[m.end() : m.end() + 15].strip()
         is_feminine = bool(_FEMININE_UNIT_RE.match(tail))
@@ -124,7 +126,10 @@ def warmup():
 
 def synthesize_pcm(text: str) -> bytes:
     """Текст -> сырой PCM 48kHz stereo 16-bit (готовый для discord.PCMAudio)."""
-    text, style = delivery(strip_tool_markup(strip_html_markup(text)))
+    text = strip_tool_markup(strip_html_markup(text))
+    if speech_language(text) == "Japanese":
+        text = japanese_only(text)
+    text, style = delivery(text)
     if isinstance(style, dict):
         style = {"segments": [{**part, "text": _clean_for_tts(part["text"])}
                               for part in style["segments"]]}

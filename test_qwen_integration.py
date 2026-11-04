@@ -10,10 +10,41 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 from audio_pcm import stereo48k
-from voice_style import delivery, delivery_instruction, strip_html_markup
+from voice_style import delivery, delivery_instruction, strip_html_markup, speech_language, japanese_only
 
 
 class AudioTests(unittest.TestCase):
+    def test_embedded_japanese_translation_reaches_tts_once(self):
+        text = ('Прекрасной погодой будет 日本語で「いい天気ですね」(Ii tenki desu ne). '
+                'Это значит Хорошая погода. Ну что скажешь о самой фразе?')
+        expected = '日本語で「いい天気ですね」.'
+        self.assertEqual(japanese_only(text), expected)
+        self.assertEqual(japanese_only('[whisper] По-японски: こんにちは。'),
+                         '[whisper] こんにちは。')
+        backend = Mock()
+        backend.synthesize.return_value = b'audio'
+        with patch.dict(sys.modules, config=types.SimpleNamespace(TTS_ENGINE='qwen'),
+                        qwen_backend=types.SimpleNamespace(backend=backend)):
+            spec = importlib.util.spec_from_file_location('test_tts', Path(__file__).with_name('tts.py'))
+            tts = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(tts)
+            self.assertEqual(tts.synthesize_pcm(text), b'audio')
+        backend.synthesize.assert_called_once_with(expected, 'normal')
+
+    def test_japanese_answer_discards_russian_translation_and_commentary(self):
+        text = ('じゃあね、あなた。また会いたいな？ '
+                '(Я сказала Джаа нэ, аната. Мата айтай на? — '
+                'Ну ладно, милый/милая (обращение). Хочу увидеться снова? .) '
+                'Как я угадала настроение? Мне нравится твой интерес к языкам...')
+        self.assertEqual(japanese_only(text), 'じゃあね、あなた。 また会いたいな？')
+        self.assertEqual(japanese_only('[whisper] またね。'), '[whisper] またね。')
+        self.assertEqual(japanese_only('Только русский ответ.'), '')
+
+    def test_japanese_voice_language_and_instructions(self):
+        self.assertEqual(speech_language('こんにちは！今日は元気です。'), 'Japanese')
+        self.assertEqual(speech_language('Привет, как дела?'), 'Russian')
+        self.assertIn('Japanese', delivery_instruction('whisper', 'Japanese'))
+        self.assertNotIn('Russian', delivery_instruction('whisper', 'Japanese'))
     def test_html_is_removed_but_quoted_text_is_preserved(self):
         self.assertEqual(strip_html_markup('</blockquote>'), '')
         self.assertEqual(strip_html_markup('&lt;/blockquote&gt;'), '')
@@ -82,7 +113,18 @@ class BackendTests(unittest.TestCase):
         self.backend._responses.put({"pcm": base64.b64encode(b"\x01\x02\x03\x04").decode()})
         self.assertEqual(self.backend.synthesize("Привет", "whisper"), b"\x01\x02\x03\x04")
         import json
-        self.assertEqual(json.loads(proc.stdin.getvalue()), {"text": "Привет", "style": "whisper", "speaker": "Ono_Anna"})
+        self.assertEqual(json.loads(proc.stdin.getvalue()), {"text": "Привет", "style": "whisper", "speaker": "Ono_Anna", "language": "Russian"})
+
+    def test_japanese_language_sent_to_worker(self):
+        proc = Mock()
+        proc.poll.return_value = None
+        proc.stdin = io.StringIO()
+        self.backend._process = proc
+        self.backend._responses = queue.Queue()
+        self.backend._responses.put({'pcm': base64.b64encode(b'1234').decode()})
+        self.backend.synthesize('こんにちは！')
+        import json
+        self.assertEqual(json.loads(proc.stdin.getvalue())['language'], 'Japanese')
 
     def test_timeout_kills_worker(self):
         proc = Mock()

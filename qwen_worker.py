@@ -91,9 +91,12 @@ def main():
             try:
                 request = json.loads(line)
                 style = request.get("style", "normal")
+                language = request.get("language", "Russian")
+                if language not in ("Russian", "Japanese"):
+                    raise ValueError("Unsupported speech language")
                 with torch.inference_mode():
-                    wavs, rate = model.generate_custom_voice(text=request["text"], language="Russian",
-                        speaker=request["speaker"], instruct=delivery_instruction(style),
+                    wavs, rate = model.generate_custom_voice(text=request["text"], language=language,
+                        speaker=request["speaker"], instruct=delivery_instruction(style, language),
                         temperature=0.8, top_p=0.9, max_new_tokens=args.max_tokens)
                 pcm = stereo48k(wavs[0], rate)
                 send({"pcm": base64.b64encode(pcm).decode("ascii")})

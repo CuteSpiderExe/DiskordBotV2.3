@@ -135,18 +135,19 @@ class VoiceSinkTests(unittest.IsolatedAsyncioTestCase):
         command.decorator_list = []
         speaker = SimpleNamespace(busy=False, vc=SimpleNamespace(is_connected=lambda: True),
                                   say=AsyncMock())
-        ctx = SimpleNamespace(guild=SimpleNamespace(id=1), send=AsyncMock())
+        ctx = SimpleNamespace(guild=SimpleNamespace(id=1), author=SimpleNamespace(id=2), send=AsyncMock())
         activity = {}
         scope = dict(commands=SimpleNamespace(Context=object), speakers={1: speaker},
                      config=SimpleNamespace(TTS_ENGINE='qwen'), asyncio=asyncio,
                      time=SimpleNamespace(monotonic=lambda: 10), utterance_locks={},
-                     last_activity=activity, last_human_activity={}, last_idle_song={},
+                     last_activity=activity, last_human_activity={}, last_idle_song={}, conversation_languages={},
                      pending_utterances={}, handle_utterance=AsyncMock(),
                      _touch_activity=lambda gid: activity.update({gid: 10}),
-                     llm=SimpleNamespace(generate_idle_chatter=lambda singing: '[singing] Ла-ла!'))
+                     llm=SimpleNamespace(get_reply_language=lambda key: 'Japanese',
+                         generate_idle_chatter=lambda singing, language: '[singing] ' + language))
         exec(compile(ast.Module(body=[command], type_ignores=[]), 'bot.py', 'exec'), scope)
         await scope['sing_cmd'](ctx)
-        speaker.say.assert_awaited_once_with('[singing] Ла-ла!')
+        speaker.say.assert_awaited_once_with('[singing] Japanese')
         speaker.say.reset_mock()
         speaker.busy = True
         await scope['sing_cmd'](ctx)
@@ -166,7 +167,8 @@ class VoiceSinkTests(unittest.IsolatedAsyncioTestCase):
             speaker.say_threadsafe.assert_not_called()
             yield 'Второе предложение.'
             speaker.say_threadsafe.assert_not_called()
-        scope = dict(speaker=speaker, llm=SimpleNamespace(stream_sentences=stream),
+        scope = dict(speaker=speaker, llm=SimpleNamespace(stream_sentences=stream,
+                     prepare_voice_answer=lambda key, text: text),
                      uid=1, text='вопрос', status='', name='', t1=0,
                      time=SimpleNamespace(monotonic=lambda: 1, strftime=lambda fmt: 'now'),
                      request_control=request_control)
@@ -191,7 +193,8 @@ class VoiceSinkTests(unittest.IsolatedAsyncioTestCase):
         sessions, activity, pending = {1: True}, {1: 0}, {}
         speaker = SimpleNamespace(busy=False, say=AsyncMock())
         handler = AsyncMock()
-        def generate(singing=False):
+        def generate(singing=False, language='Russian'):
+            self.assertEqual(language, 'Japanese')
             activity[1] = 100
             pending[1] = {2: b'speech'}
             sessions[1] = False
@@ -201,7 +204,7 @@ class VoiceSinkTests(unittest.IsolatedAsyncioTestCase):
                                              to_thread=asyncio.to_thread),
                      time=SimpleNamespace(monotonic=lambda: 100),
                      config=SimpleNamespace(IDLE_CHATTER_SEC=1, IDLE_SONG_SEC=300),
-                     last_human_activity={1: 0}, last_idle_song={},
+                     last_human_activity={1: 0}, last_idle_song={}, conversation_languages={1: 'Japanese'},
                      voice_sessions=sessions, last_activity=activity,
                      pending_utterances=pending, utterance_locks={}, speakers={1: speaker},
                      bot=SimpleNamespace(user=SimpleNamespace(id=99)),
