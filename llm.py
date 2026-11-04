@@ -11,9 +11,27 @@ import ollama
 import config
 import discord_tools
 import memory
-from voice_style import strip_markers, strip_tool_markup, strip_html_markup, TOOL_MARKUP_RE
+from voice_style import strip_markers, strip_tool_markup, strip_html_markup, TOOL_MARKUP_RE, japanese_only
 
 _client = ollama.Client(host=config.OLLAMA_HOST, timeout=config.OLLAMA_TIMEOUT_SEC)
+_reply_languages = {}
+
+
+def prepare_voice_answer(key: str, text: str) -> str:
+    if not text.strip():
+        return ""
+    if _reply_languages.get(key) == "Japanese":
+        return japanese_only(text) or "すみません。もう一度お願いします。"
+    return text
+
+
+def update_reply_language(key: str, text: str):
+    """Voice requests switch this listener's response language until restart."""
+    request = re.search(
+        r"\b(?:говори|поговори|отвечай|ответь|общайся|перейди|давай)\b"
+        r"[^.!?]{0,60}\b(?:по[-\s]+)?(японск\w*|русск\w*)", text, re.I)
+    if request and not re.search(r"\bне\b", text[:request.end()], re.I):
+        _reply_languages[key] = "Japanese" if request.group(1).lower().startswith("япон") else "Russian"
 
 # Промпт (character.txt) просит не рассказывать о себе в третьем лице
 # ("Сказала: ..."), но LLM это соблюдает не всегда (та же вероятностная
@@ -136,6 +154,12 @@ def _system_prompt(key: str, voice: bool, status: str = "", name: str = "") -> s
     if name:
         memory.set_name(key, name)
     system = PERSONA + (VOICE_SUFFIX if voice else "") + TOOLS_REMINDER + FOCUS_REMINDER + FACTS_REMINDER
+    if voice:
+        language = _reply_languages.get(key, "Russian")
+        system += ("\nЯзык ответа: японский. Собеседник говорит по-русски: понимай его русский "
+                   "запрос и отвечай только по-японски, японской письменностью, без перевода "
+                   "и транскрипции. Сохраняй характер и краткость." if language == "Japanese" else
+                   "\nОтвечай по-русски.")
     summary = memory.entry(key)["summary"]
     if summary:
         system += f"\n\nЧто ты помнишь об этом собеседнике: {summary}"
@@ -371,7 +395,7 @@ def _stream_sentences(
     finally:
         request = request_control.current.get()
         if final_answer and not (request and request.cancelled.is_set()):
-            memory.append(key, "assistant", strip_markers(final_answer))
+            memory.append(key, "assistant", strip_markers(prepare_voice_answer(key, final_answer)))
             compress_history(key)
             memory.save()
 

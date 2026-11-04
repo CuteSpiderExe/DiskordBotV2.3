@@ -245,6 +245,7 @@ async def _process_utterance(guild_id: int, uid: int, pcm16k: bytes):
         return
 
     guild = bot.get_guild(guild_id)
+    llm.update_reply_language(str(uid), text)
     # Принятый новый вопрос заменяет устаревшую озвучку, включая синтез.
     await speaker.interrupt()
     if _is_singing_request(text):
@@ -288,7 +289,7 @@ async def _process_utterance(guild_id: int, uid: int, pcm16k: bytes):
             request_control.check()
             full.append(sentence)
         request_control.check()
-        answer = ' '.join(full).strip()
+        answer = llm.prepare_voice_answer(str(uid), ' '.join(full).strip())
         if answer:
             print(f"[timing] Полный ответ LLM: {time.monotonic() - t1:.1f}с")
             print(f"[{time.strftime('%H:%M:%S')}] [bot] {answer}")

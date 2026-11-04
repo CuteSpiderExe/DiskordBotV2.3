@@ -10,10 +10,24 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 from audio_pcm import stereo48k
-from voice_style import delivery, delivery_instruction, strip_html_markup
+from voice_style import delivery, delivery_instruction, strip_html_markup, speech_language, japanese_only
 
 
 class AudioTests(unittest.TestCase):
+    def test_japanese_answer_discards_russian_translation_and_commentary(self):
+        text = ('じゃあね、あなた。また会いたいな？ '
+                '(Я сказала Джаа нэ, аната. Мата айтай на? — '
+                'Ну ладно, милый/милая (обращение). Хочу увидеться снова? .) '
+                'Как я угадала настроение? Мне нравится твой интерес к языкам...')
+        self.assertEqual(japanese_only(text), 'じゃあね、あなた。 また会いたいな？')
+        self.assertEqual(japanese_only('[whisper] またね。'), '[whisper] またね。')
+        self.assertEqual(japanese_only('Только русский ответ.'), '')
+
+    def test_japanese_voice_language_and_instructions(self):
+        self.assertEqual(speech_language('こんにちは！今日は元気です。'), 'Japanese')
+        self.assertEqual(speech_language('Привет, как дела?'), 'Russian')
+        self.assertIn('Japanese', delivery_instruction('whisper', 'Japanese'))
+        self.assertNotIn('Russian', delivery_instruction('whisper', 'Japanese'))
     def test_html_is_removed_but_quoted_text_is_preserved(self):
         self.assertEqual(strip_html_markup('</blockquote>'), '')
         self.assertEqual(strip_html_markup('&lt;/blockquote&gt;'), '')
@@ -82,7 +96,18 @@ class BackendTests(unittest.TestCase):
         self.backend._responses.put({"pcm": base64.b64encode(b"\x01\x02\x03\x04").decode()})
         self.assertEqual(self.backend.synthesize("Привет", "whisper"), b"\x01\x02\x03\x04")
         import json
-        self.assertEqual(json.loads(proc.stdin.getvalue()), {"text": "Привет", "style": "whisper", "speaker": "Ono_Anna"})
+        self.assertEqual(json.loads(proc.stdin.getvalue()), {"text": "Привет", "style": "whisper", "speaker": "Ono_Anna", "language": "Russian"})
+
+    def test_japanese_language_sent_to_worker(self):
+        proc = Mock()
+        proc.poll.return_value = None
+        proc.stdin = io.StringIO()
+        self.backend._process = proc
+        self.backend._responses = queue.Queue()
+        self.backend._responses.put({'pcm': base64.b64encode(b'1234').decode()})
+        self.backend.synthesize('こんにちは！')
+        import json
+        self.assertEqual(json.loads(proc.stdin.getvalue())['language'], 'Japanese')
 
     def test_timeout_kills_worker(self):
         proc = Mock()

@@ -91,6 +91,28 @@ class MemoryTests(unittest.TestCase):
         self.memory.commit_compression('a',self.memory.old_messages('a'),'SECRET_OTHER_USER')
         self.assertNotIn('SECRET_OTHER_USER',self.llm._system_prompt('b',False))
 
+    def test_russian_requests_switch_response_language_per_user(self):
+        self.llm.update_reply_language('a', 'Ари, говори по-японски')
+        self.assertIn('отвечай только по-японски', self.llm._system_prompt('a', True))
+        self.assertIn('Отвечай по-русски', self.llm._system_prompt('b', True))
+        self.llm.update_reply_language('a', 'Как у тебя дела?')
+        self.assertEqual(self.llm._reply_languages['a'], 'Japanese')
+        self.llm.update_reply_language('a', 'Ари, говори по-русски')
+        self.assertEqual(self.llm._reply_languages['a'], 'Russian')
+
+    def test_japanese_mode_filters_answer_and_saved_history(self):
+        self.llm.update_reply_language('a', 'Ари, говори по-японски')
+        mixed = 'こんにちは！ Это значит привет. Как дела?'
+        self.assertEqual(self.llm.prepare_voice_answer('a', mixed), 'こんにちは！')
+        self.assertEqual(self.llm.prepare_voice_answer('b', 'Привет!'), 'Привет!')
+        self.assertEqual(self.llm.prepare_voice_answer('a', ''), '')
+        self.assertEqual(self.llm.prepare_voice_answer('a', 'Привет!'),
+                         'すみません。もう一度お願いします。')
+        self.client.chat.return_value = iter([{'message': {'content': mixed}}])
+        with patch.object(self.llm, 'compress_history'):
+            list(self.llm.stream_sentences('a', 'привет'))
+        self.assertEqual(self.memory.entry('a')['recent'][-1]['content'], 'こんにちは！')
+
     def test_cancelled_stream_cannot_commit_or_yield(self):
         request=request_control.Request()
         def chunks():

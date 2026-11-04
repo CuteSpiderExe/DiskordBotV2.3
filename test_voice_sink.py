@@ -166,7 +166,8 @@ class VoiceSinkTests(unittest.IsolatedAsyncioTestCase):
             speaker.say_threadsafe.assert_not_called()
             yield 'Второе предложение.'
             speaker.say_threadsafe.assert_not_called()
-        scope = dict(speaker=speaker, llm=SimpleNamespace(stream_sentences=stream),
+        scope = dict(speaker=speaker, llm=SimpleNamespace(stream_sentences=stream,
+                     prepare_voice_answer=lambda key, text: text),
                      uid=1, text='вопрос', status='', name='', t1=0,
                      time=SimpleNamespace(monotonic=lambda: 1, strftime=lambda fmt: 'now'),
                      request_control=request_control)

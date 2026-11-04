@@ -52,9 +52,23 @@ def delivery(text: str) -> tuple[str, str | dict]:
     return strip_markers(text), instruction
 
 
-def delivery_instruction(style) -> str:
+def speech_language(text: str) -> str:
+    return "Japanese" if re.search(r"[\u3040-\u30ff\u3400-\u9fff]", text) else "Russian"
+
+
+def japanese_only(text: str) -> str:
+    """Keep Japanese sentences; reject Russian translations/commentary."""
+    # Parenthetical translations can themselves contain sentence punctuation.
+    text = re.sub(r"\([^()]*[А-Яа-яЁё][^()]*\)", "", text)
+    sentences = re.split(r"(?<=[。！？.!?？])\s*|\n+", text)
+    return " ".join(part.strip() for part in sentences
+                    if speech_language(part) == "Japanese"
+                    and not re.search(r"[А-Яа-яЁё]", part)).strip()
+
+
+def delivery_instruction(style, language="Russian") -> str:
     if isinstance(style, str):
-        return STYLE_INSTRUCTIONS.get(style, STYLE_INSTRUCTIONS["normal"])
+        return STYLE_INSTRUCTIONS.get(style, STYLE_INSTRUCTIONS["normal"]).replace("Russian", language)
     lines = ["Read the supplied Russian text once, in order, as one continuous utterance. "
              "Change delivery only at the following text boundaries. "
              "Quoted fragments identify the text; do not read these directions aloud."]
@@ -62,7 +76,7 @@ def delivery_instruction(style) -> str:
         instruction = STYLE_INSTRUCTIONS.get(part["style"], STYLE_INSTRUCTIONS["normal"])
         instruction = instruction.replace("throughout, ", "")
         lines.append(f'For this fragment only: {json.dumps(part["text"], ensure_ascii=False)}. {instruction}')
-    return "\n".join(lines)
+    return "\n".join(lines).replace("Russian", language)
 
 
 def strip_markers(text: str) -> str:

@@ -12,6 +12,7 @@ import time
 import request_control
 
 import config
+from voice_style import speech_language
 
 
 class QwenBackend:
@@ -90,7 +91,7 @@ class QwenBackend:
             self._start()
             try:
                 self._process.stdin.write(json.dumps({"text": text, "style": style,
-                    "speaker": config.QWEN_SPEAKER}, ensure_ascii=False) + "\n")
+                    "speaker": config.QWEN_SPEAKER, "language": speech_language(text)}, ensure_ascii=False) + "\n")
                 self._process.stdin.flush()
                 return base64.b64decode(self._receive()["pcm"], validate=True)
             except Exception:
