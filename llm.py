@@ -12,9 +12,20 @@ import config
 import discord_tools
 import memory
 from voice_style import strip_markers, strip_tool_markup, strip_html_markup, TOOL_MARKUP_RE, japanese_only
+from voice_style import emotion_request, emotion_reaction
 
 _client = ollama.Client(host=config.OLLAMA_HOST, timeout=config.OLLAMA_TIMEOUT_SEC)
 _reply_languages = {}
+
+
+def get_reply_language(key: str) -> str:
+    return _reply_languages.get(key, "Russian")
+
+
+def set_reply_language(key: str, language: str):
+    if language not in ("Russian", "Japanese"):
+        raise ValueError("Unsupported reply language")
+    _reply_languages[key] = language
 
 
 def prepare_voice_answer(key: str, text: str) -> str:
@@ -28,10 +39,10 @@ def prepare_voice_answer(key: str, text: str) -> str:
 def update_reply_language(key: str, text: str):
     """Voice requests switch this listener's response language until restart."""
     request = re.search(
-        r"\b(?:говори|поговори|отвечай|ответь|общайся|перейди|давай)\b"
+        r"\b(?:говори|поговори|отвечай|ответь|общайся|перейди|давай|спой|напой)\b"
         r"[^.!?]{0,60}\b(?:по[-\s]+)?(японск\w*|русск\w*)", text, re.I)
     if request and not re.search(r"\bне\b", text[:request.end()], re.I):
-        _reply_languages[key] = "Japanese" if request.group(1).lower().startswith("япон") else "Russian"
+        set_reply_language(key, "Japanese" if request.group(1).lower().startswith("япон") else "Russian")
 
 # Промпт (character.txt) просит не рассказывать о себе в третьем лице
 # ("Сказала: ..."), но LLM это соблюдает не всегда (та же вероятностная
@@ -307,34 +318,103 @@ def _active_chunks(stream):
             close()
 
 
+def _japanese_translation_phrase(text: str) -> str | None:
+    """Separate the phrase from the spoken instruction, including common ASR variants."""
+    text = re.sub(r"^\s*(?:ари|ария|арии)\b[\s,:.!?-]*", "", text, flags=re.I)
+    language = r"(?:на\s+японск(?:ом|ий)(?:\s+язык(?:е)?)?|по[-\s]+японски)"
+    command = r"(?:как\s+(?:будет|быть|бы|будто|сказать)|скажи|сказать|переведи|перевести)"
+    # Prefer a suffix language instruction: 'скажи привет по-японски'.
+    match = re.fullmatch(command + r"\s+(.+?)\s+" + language + r"[\s?.!]*", text, re.I)
+    if not match:
+        match = re.fullmatch(command + r"\s+" + language + r"[\s,:—-]+(.+)", text, re.I)
+    if not match:
+        return None
+    phrase = match.group(1).strip(' \t\n«»"“”')
+    return phrase or None
+
+
+def _is_japanese_translation(text: str) -> bool:
+    return _japanese_translation_phrase(text) is not None
+
+
+def _translation_messages(phrase: str):
+    return [
+        {"role": "system", "content":
+         "Переведи текст пользователя на японский. Верни ТОЛЬКО японский перевод. "
+         "Без русского текста, латиницы, транскрипции, пояснений, комментариев, "
+         "вопросов и сценических пометок. Не отвечай на саму переводимую фразу."},
+        {"role": "user", "content": phrase}]
+
+
+def _complete_voice_chunks(messages, *, translation=False):
+    """Retry token-limited output before any text or tool calls escape."""
+    for attempt in range(2):
+        budget = config.LLM_MAX_TOKENS if attempt == 0 else max(512, config.LLM_MAX_TOKENS * 2)
+        request_messages = messages
+        if attempt:
+            request_messages = messages + [{"role": "user", "content":
+                "Верни только японский перевод без пояснений." if translation else
+                "Дай законченный короткий ответ на мой последний запрос: максимум 2 предложения. "
+                "Если это история — расскажи её целиком в этих двух предложениях. "
+                "Сохрани выбранный язык ответа."}]
+        stream = _client.chat(
+            model=config.OLLAMA_MODEL, messages=request_messages,
+            tools=[] if translation else discord_tools.VOICE_TOOLS, options=_opts(num_predict=budget),
+            keep_alive=config.OLLAMA_KEEP_ALIVE, think=False, stream=True)
+        chunks = list(_active_chunks(stream))
+        reason = next((chunk.get("done_reason") for chunk in reversed(chunks)
+                       if chunk.get("done_reason")), None)
+        stats = chunks[-1] if chunks else {}
+        print(f"[llm finish] reason={reason or 'unknown'}; budget={budget}; attempt={attempt + 1}; "
+              f"prompt={stats.get('prompt_eval_count')}; generated={stats.get('eval_count')}; "
+              f"context={config.OLLAMA_NUM_CTX}")
+        if reason != "length":
+            return chunks
+        print("[llm] Достигнут лимит токенов; обрезанный ответ не озвучивается.")
+    # Keep both speech and history free of an unfinished model response.
+    return [{"message": {"content": "Не получилось закончить ответ. Попробуй спросить ещё раз."}}]
+
+
 def _stream_sentences(
     key: str, user_text: str, status: str = "", name: str = ""
 ) -> Generator[str, None, None]:
     """
-    Стримит ответ LLM и выдаёт его по законченным предложениям,
-    чтобы TTS мог начинать говорить, не дожидаясь всего ответа.
-    В конце сохраняет полный ответ в память.
+    Проверяет завершение ответа LLM и выдаёт его предложения.
+    Вызывающая сторона собирает их для единой озвучки; полный ответ сохраняется в память.
     """
     memory.append(key, "user", user_text)
+    emotion = emotion_request(user_text)
+    if emotion:
+        style, phrase_to_say = emotion
+        language = get_reply_language(key)
+        if phrase_to_say is None:
+            answer = emotion_reaction(style, language)
+        elif language == "Russian":
+            answer = f"[{style}] " + _sanitize(strip_markers(phrase_to_say))
+        else:
+            chunks = _complete_voice_chunks(_translation_messages(phrase_to_say), translation=True)
+            translated = japanese_only(_sanitize(''.join(
+                chunk.get('message', {}).get('content', '') for chunk in chunks)))
+            answer = f"[{style}] {translated}" if translated else emotion_reaction(style, language)
+        request_control.check()
+        memory.append(key, "assistant", strip_markers(answer))
+        memory.save()
+        yield answer
+        return
+    phrase = _japanese_translation_phrase(user_text)
+    translation = phrase is not None
     messages = [
         {"role": "system", "content": _system_prompt(key, True, status, name)}
     ] + memory.entry(key)["recent"]
+    if translation:
+        # Translation needs neither character instructions nor Discord tools.
+        # Including old verbose replies encourages the model to imitate them.
+        messages = _translation_messages(phrase)
 
     final_answer = ""
     try:
         for _ in range(discord_tools.MAX_TOOL_ROUNDS):
-            stream = _client.chat(
-                model=config.OLLAMA_MODEL,
-                messages=messages,
-                tools=discord_tools.VOICE_TOOLS,
-                options=_opts(),
-                keep_alive=config.OLLAMA_KEEP_ALIVE,
-                # В текущей версии Ollama streaming с think=True иногда
-                # отдаёт только скрытое рассуждение без финального текста;
-                # для голосового ответа нужен надёжный поток content.
-                think=False,
-                stream=True,
-            )
+            stream = _complete_voice_chunks(messages, translation=translation)
 
             buffer = ""
             round_answer = ""
@@ -443,7 +523,7 @@ def generate_kick_complaint() -> str:
     return resp["message"]["content"].strip()
 
 
-def generate_idle_chatter(singing: bool = False) -> str:
+def generate_idle_chatter(singing: bool = False, language: str = "Russian") -> str:
     """Спонтанная реплика, когда в канале давно никто не говорил (без памяти,
     как и приветствие — это не ответ конкретному человеку)."""
     messages = [
@@ -471,6 +551,13 @@ def generate_idle_chatter(singing: bool = False) -> str:
             {"role": "user", "content": "В канале две минуты тишины. "
              "Скажи что-нибудь от себя в своём стиле, одно короткое предложение."},
         ]
+    if language == "Japanese":
+        messages[0]["content"] += (
+            "\nЯзык этой реплики — только японский, японской письменностью. "
+            "Никакого русского текста, перевода и латинской транскрипции. "
+            "Верни только четыре короткие строки песни." if singing else
+            "\nОтветь только по-японски, японской письменностью, одним коротким "
+            "предложением без перевода и транскрипции.")
     resp = _client.chat(
         model=config.OLLAMA_MODEL,
         messages=messages,
@@ -479,6 +566,8 @@ def generate_idle_chatter(singing: bool = False) -> str:
         think=False,
     )
     text = _sanitize_idle_chatter(resp["message"]["content"])
+    if language == "Japanese":
+        text = japanese_only(text) or ("静かな夜、星が光る。風に乗せて、夢を歌う。" if singing else "静かですね。")
     return "[singing] " + strip_markers(text) if singing else text
 
 

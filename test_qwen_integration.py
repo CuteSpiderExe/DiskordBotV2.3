@@ -14,6 +14,23 @@ from voice_style import delivery, delivery_instruction, strip_html_markup, speec
 
 
 class AudioTests(unittest.TestCase):
+    def test_embedded_japanese_translation_reaches_tts_once(self):
+        text = ('Прекрасной погодой будет 日本語で「いい天気ですね」(Ii tenki desu ne). '
+                'Это значит Хорошая погода. Ну что скажешь о самой фразе?')
+        expected = '日本語で「いい天気ですね」.'
+        self.assertEqual(japanese_only(text), expected)
+        self.assertEqual(japanese_only('[whisper] По-японски: こんにちは。'),
+                         '[whisper] こんにちは。')
+        backend = Mock()
+        backend.synthesize.return_value = b'audio'
+        with patch.dict(sys.modules, config=types.SimpleNamespace(TTS_ENGINE='qwen'),
+                        qwen_backend=types.SimpleNamespace(backend=backend)):
+            spec = importlib.util.spec_from_file_location('test_tts', Path(__file__).with_name('tts.py'))
+            tts = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(tts)
+            self.assertEqual(tts.synthesize_pcm(text), b'audio')
+        backend.synthesize.assert_called_once_with(expected, 'normal')
+
     def test_japanese_answer_discards_russian_translation_and_commentary(self):
         text = ('じゃあね、あなた。また会いたいな？ '
                 '(Я сказала Джаа нэ, аната. Мата айтай на? — '

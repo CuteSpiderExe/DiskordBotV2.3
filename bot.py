@@ -53,6 +53,7 @@ utterance_locks: dict[int, asyncio.Lock] = {}
 last_activity: dict[int, float] = {}
 last_human_activity: dict[int, float] = {}
 last_idle_song: dict[int, float] = {}
+conversation_languages: dict[int, str] = {}
 # guild_id -> фоновая задача, которая болтает, если в канале долго тишина
 idle_tasks: dict[int, asyncio.Task] = {}
 # guild_id-и, для которых прямо сейчас идёт подключение (защита от гонки
@@ -246,6 +247,8 @@ async def _process_utterance(guild_id: int, uid: int, pcm16k: bytes):
 
     guild = bot.get_guild(guild_id)
     llm.update_reply_language(str(uid), text)
+    language = llm.get_reply_language(str(uid))
+    conversation_languages[guild_id] = language
     # Принятый новый вопрос заменяет устаревшую озвучку, включая синтез.
     await speaker.interrupt()
     if _is_singing_request(text):
@@ -253,7 +256,7 @@ async def _process_utterance(guild_id: int, uid: int, pcm16k: bytes):
             await speaker.say("Напевная подача доступна с голосом Qwen.")
             return
         activity = last_human_activity.get(guild_id)
-        line = await asyncio.to_thread(llm.generate_idle_chatter, singing=True)
+        line = await asyncio.to_thread(llm.generate_idle_chatter, singing=True, language=language)
         request_control.check()
         if (speakers.get(guild_id) is speaker and speaker.vc.is_connected()
                 and last_human_activity.get(guild_id) == activity
@@ -384,7 +387,8 @@ async def idle_watcher(guild: discord.Guild):
         try:
             activity = last_activity.get(guild_id)
             async with lock:
-                line = await asyncio.to_thread(llm.generate_idle_chatter, singing=singing)
+                line = await asyncio.to_thread(llm.generate_idle_chatter, singing=singing,
+                    language=conversation_languages.get(guild_id, "Russian"))
                 if (last_activity.get(guild_id) != activity or speaker.busy
                         or pending_utterances.get(guild_id)
                         or not voice_sessions.get(guild_id)):
@@ -611,10 +615,12 @@ async def sing_cmd(ctx: commands.Context):
     _touch_activity(guild_id)
     last_human_activity[guild_id] = time.monotonic()
     activity = last_activity[guild_id]
+    language = llm.get_reply_language(str(ctx.author.id))
+    conversation_languages[guild_id] = language
     try:
         async with lock:
             await ctx.send("Сочиняю песенку…")
-            line = await asyncio.to_thread(llm.generate_idle_chatter, singing=True)
+            line = await asyncio.to_thread(llm.generate_idle_chatter, singing=True, language=language)
             if (speakers.get(guild_id) is not speaker or not speaker.vc.is_connected()
                     or last_activity.get(guild_id) != activity
                     or pending_utterances.get(guild_id)):
@@ -633,7 +639,30 @@ async def sing_cmd(ctx: commands.Context):
             await handle_utterance(guild_id, uid, pcm)
 
 
-@bot.command(name="voice")
+@bot.command(name="language", aliases=["lang", "язык"])
+async def language_cmd(ctx: commands.Context, language: str = None):
+    """Язык голосовых ответов для тебя: ari!language ru или ja."""
+    key = str(ctx.author.id)
+    names = {"Russian": "русский", "Japanese": "японский"}
+    valid = {"ru": "Russian", "русский": "Russian", "russian": "Russian",
+             "ja": "Japanese", "jp": "Japanese", "японский": "Japanese", "japanese": "Japanese"}
+    if language is None:
+        await ctx.send(f"Язык моих голосовых ответов тебе: **{names[llm.get_reply_language(key)]}**. "
+                       "Переключение: `ari!language ru` или `ari!language ja`. "
+                       "Входящую речь распознаю по-русски.")
+        return
+    selected = valid.get(language.casefold())
+    if selected is None:
+        await ctx.send("Доступны: `ari!language ru` (русский), `ari!language ja` (японский).")
+        return
+    llm.set_reply_language(key, selected)
+    if ctx.guild is not None:
+        conversation_languages[ctx.guild.id] = selected
+    await ctx.send(f"Буду отвечать тебе голосом на языке: **{names[selected]}**. "
+                   "Настройка действует до перезапуска; входящая речь — русская.")
+
+
+@bot.command(name="voice", aliases=["голос"])
 async def voice_cmd(ctx: commands.Context, speaker_name: str = None):
     """Показать или сменить голос активного движка."""
     if config.TTS_ENGINE == "qwen":
@@ -642,7 +671,7 @@ async def voice_cmd(ctx: commands.Context, speaker_name: str = None):
             await ctx.send(f"Текущий голос: **{config.QWEN_SPEAKER}** (Qwen). Доступны: {', '.join(valid.values())}")
         elif speaker_name.lower() in valid:
             config.QWEN_SPEAKER = valid[speaker_name.lower()]
-            await ctx.send(f"Голос сменён на **{config.QWEN_SPEAKER}**.")
+            await ctx.send(f"Голос сменён на **{config.QWEN_SPEAKER}** для всех собеседников до перезапуска.")
         else:
             await ctx.send(f"Доступны: {', '.join(valid.values())}")
         return

@@ -21,6 +21,45 @@ STYLE_INSTRUCTIONS = {
     "singing": "Sing these Russian lyrics softly and melodically, like casually humming a little song to yourself. Use a simple gentle tune, sustained vowels and a clear musical rhythm, rather than ordinary spoken narration.",
 }
 _MARKER = re.compile(r"\[(normal|whisper|amused|sigh|excited|sad|singing)\]", re.IGNORECASE)
+
+# Explicit delivery requests, not mentions of a mood in ordinary conversation.
+_REACTION_COMMANDS = {
+    "amused": r"(?:посмейся|рассмейся|засмейся|хихикни|хохотни|смеяться|посмеяться|рассмеяться)",
+    "sigh": r"(?:вздохни|повздыхай|вздохнуть)",
+    "whisper": r"(?:пошепчи|пошептать|(?:говори|поговори|говорить|поговорить)\s+ш[её]потом)",
+    "excited": r"(?:порадуйся|обрадуйся|говори\s+радостно|поговори\s+радостно)",
+    "sad": r"(?:погрусти|говори\s+грустно|поговори\s+грустно)",
+    "normal": r"(?:говори\s+(?:обычно|нормально)|обычный\s+голос)",
+}
+_REACTION_TEXT = {
+    "Russian": {"amused": "Ха-ха-ха!", "sigh": "Эх…", "whisper": "Только между нами.",
+                "excited": "Ура! Как здорово!", "sad": "Мне немного грустно.", "normal": "Хорошо, говорю обычно."},
+    "Japanese": {"amused": "あははは！", "sigh": "はぁ…", "whisper": "ここだけの秘密だよ。",
+                 "excited": "やった！うれしい！", "sad": "少し寂しいね。", "normal": "普通に話すね。"},
+}
+
+
+def emotion_request(text: str):
+    """Return (delivery, optional text to say) only for explicit requests."""
+    text = re.sub(r"^\s*(?:ари|ария|арии)\b[\s,!.:-]*", "", text, flags=re.I)
+    text = re.sub(r"\bпожалуйста\b[,]?", "", text, flags=re.I).strip(" ,.!?")
+    text = re.sub(r"^(?:можешь|давай|прошу)\s+", "", text, flags=re.I).strip()
+    for style, command in _REACTION_COMMANDS.items():
+        if re.fullmatch(command, text, re.I):
+            return style, None
+    match = re.fullmatch(
+        r"(?:скажи|произнеси)\s+(ш[её]потом|со\s+смехом|со\s+вздохом|радостно|грустно|обычно)"
+        r"[\s,:—-]+(.+)", text, re.I)
+    if match:
+        styles = {"шепотом": "whisper", "шёпотом": "whisper", "со смехом": "amused",
+                  "со вздохом": "sigh", "радостно": "excited", "грустно": "sad", "обычно": "normal"}
+        return styles[re.sub(r"\s+", " ", match.group(1).lower())], match.group(2)
+    return None
+
+
+def emotion_reaction(style: str, language: str) -> str:
+    return f"[{style}] " + _REACTION_TEXT[language][style]
+
 TOOL_MARKUP_RE = re.compile(
     r"\b(?:function_call|tool_calls?)\b|<\|?(?:tool_call|function_call)\b|"
     r"\(?\s*я\s+(?:решил[аи]?\s+)?(?:вызываю|использую|использовать)\s+инструмент\b",
@@ -59,11 +98,21 @@ def speech_language(text: str) -> str:
 def japanese_only(text: str) -> str:
     """Keep Japanese sentences; reject Russian translations/commentary."""
     # Parenthetical translations can themselves contain sentence punctuation.
-    text = re.sub(r"\([^()]*[А-Яа-яЁё][^()]*\)", "", text)
+    text = re.sub(r"\([^()]*[А-Яа-яЁёA-Za-z][^()]*\)", "", text)
     sentences = re.split(r"(?<=[。！？.!?？])\s*|\n+", text)
-    return " ".join(part.strip() for part in sentences
-                    if speech_language(part) == "Japanese"
-                    and not re.search(r"[А-Яа-яЁё]", part)).strip()
+    kept = []
+    for part in sentences:
+        if speech_language(part) != "Japanese":
+            continue
+        if re.search(r"[А-Яа-яЁё]", part):
+            # A translation may be embedded in a Russian sentence. Keep its
+            # Japanese spans instead of dropping the whole sentence and audio.
+            spans = re.findall(r"[\u3040-\u30ff\u3400-\u9fff]"
+                               r"[\u3040-\u30ff\u3400-\u9fff\d\s、。，！？「」『』ー.!?…]*", part)
+            cue = list(_MARKER.finditer(part.split(spans[0], 1)[0])) if spans else []
+            part = (cue[-1].group() + " " if cue else "") + " ".join(s.strip() for s in spans)
+        kept.append(part.strip())
+    return " ".join(kept).strip()
 
 
 def delivery_instruction(style, language="Russian") -> str:

@@ -24,6 +24,34 @@ def module(name, path):
 
 
 class MemoryTests(unittest.TestCase):
+    def test_emotions_bypass_llm_in_both_languages(self):
+        commands = {'посмейся': 'amused', 'вздохни': 'sigh', 'пошепчи': 'whisper',
+                    'порадуйся': 'excited', 'погрусти': 'sad', 'говори обычно': 'normal'}
+        from voice_style import delivery, speech_language
+        for language in ('Russian', 'Japanese'):
+            self.llm.set_reply_language('a', language)
+            for command, style in commands.items():
+                with self.subTest(language=language, command=command):
+                    answer = list(self.llm.stream_sentences('a', 'Ари, ' + command + ', пожалуйста!'))
+                    self.assertEqual(len(answer), 1)
+                    spoken, actual_style = delivery(answer[0])
+                    self.assertEqual(actual_style, style)
+                    self.assertEqual(speech_language(spoken), language)
+                    self.assertNotIn('もう一度', spoken)
+        self.client.chat.assert_not_called()
+
+    def test_emotion_requests_with_text_and_negation(self):
+        from voice_style import emotion_request
+        for text in ('Ари, не смейся', 'Мне грустно', 'Почему ты вздохнула?',
+                     'Ари, расскажи про смех', 'Перестань говорить шепотом'):
+            self.assertIsNone(emotion_request(text))
+        self.assertEqual(emotion_request('Ари, скажи шепотом привет'), ('whisper', 'привет'))
+        self.llm.set_reply_language('a', 'Japanese')
+        self.client.chat.return_value = iter([{'message': {'content': 'こんにちは。'}, 'done_reason': 'stop'}])
+        answer = list(self.llm.stream_sentences('a', 'Ари, скажи шепотом привет'))
+        self.assertEqual(answer, ['[whisper] こんにちは。'])
+        self.assertEqual(self.client.chat.call_args.kwargs['tools'], [])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.cfg = types.SimpleNamespace(MEMORY_FILE=str(Path(self.tmp.name)/'memory.json'),
@@ -126,6 +154,60 @@ class MemoryTests(unittest.TestCase):
         finally: request_control.current.reset(token)
         self.assertFalse(any(m['role']=='assistant' for m in self.memory.entry('a')['recent']))
 
+    def test_token_limit_retries_before_speech_and_history(self):
+        self.client.chat.side_effect = [
+            iter([{'message': {'content': 'История оборвалась на сло'}},
+                  {'done': True, 'done_reason': 'length'}]),
+            iter([{'message': {'content': 'Я заблудилась, но нашла дорогу домой.'}},
+                  {'done': True, 'done_reason': 'stop'}])]
+        with patch.object(self.llm, 'compress_history'):
+            answer = ' '.join(self.llm.stream_sentences('a', 'расскажи историю'))
+        self.assertEqual(answer, 'Я заблудилась, но нашла дорогу домой.')
+        self.assertEqual(self.memory.entry('a')['recent'][-1]['content'], answer)
+        self.assertEqual(self.client.chat.call_count, 2)
+        self.assertGreater(self.client.chat.call_args.kwargs['options']['num_predict'],
+                           self.cfg.LLM_MAX_TOKENS)
+
+    def test_japanese_translation_uses_only_request_without_history_or_tools(self):
+        self.client.chat.return_value = iter([
+            {'message': {'content': 'いい天気ですね。'}, 'done_reason': 'stop'}])
+        with patch.object(self.llm, 'compress_history'):
+            answer = ' '.join(self.llm.stream_sentences(
+                'a', 'Ари, как будет на японском прекрасная погода?'))
+        self.assertEqual(answer, 'いい天気ですね。')
+        call = self.client.chat.call_args.kwargs
+        self.assertEqual(call['tools'], [])
+        self.assertEqual(len(call['messages']), 2)
+        self.assertIn('ТОЛЬКО японский перевод', call['messages'][0]['content'])
+        self.assertFalse(self.llm._is_japanese_translation('Ари, говори по-японски'))
+        self.assertFalse(self.llm._is_japanese_translation('Расскажи про японскую культуру'))
+        self.assertEqual(call['messages'][1]['content'], 'прекрасная погода?')
+
+    def test_translation_extracts_phrase_from_recognized_voice_variants(self):
+        cases = {
+            'Ари, как бы на японском «привет»': 'привет',
+            'Ари, как будто на японском, привет!': 'привет!',
+            'Ари, как быть на японском хорошее погода?': 'хорошее погода?',
+            'Ари, скажи привет по-японски': 'привет',
+            'Переведи на японский: спокойной ночи': 'спокойной ночи',
+        }
+        for request, phrase in cases.items():
+            with self.subTest(request=request):
+                self.assertEqual(self.llm._japanese_translation_phrase(request), phrase)
+        for request in ('Ари, говори по-японски', 'Расскажи о японской культуре',
+                        'Не переводи на японский привет', 'Как будет погода завтра?'):
+            self.assertIsNone(self.llm._japanese_translation_phrase(request))
+
+    def test_repeated_token_limit_has_bounded_retry_and_no_fragment(self):
+        self.client.chat.side_effect = [iter([
+            {'message': {'content': 'Обрезанный фрагмент'}},
+            {'done_reason': 'length'}]) for _ in range(2)]
+        with patch.object(self.llm, 'compress_history'):
+            answer = ' '.join(self.llm.stream_sentences('a', 'расскажи историю'))
+        self.assertNotIn('Обрезанный', answer)
+        self.assertIn('Попробуй спросить ещё раз.', answer)
+        self.assertEqual(self.client.chat.call_count, 2)
+
     def test_cancelled_compression_does_not_remove_messages(self):
         before=self.memory.entry('a')
         request=request_control.Request()
@@ -165,6 +247,14 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(self.llm._sanitize_idle_chatter(
             'Как дела? (Я решила использовать инструмент для имитации звука) '
             'function_call{name: play_sound, arguments:{ sound_type'), 'Как дела?')
+
+    def test_japanese_song_language_is_requested_and_filtered(self):
+        self.client.chat.return_value = {'message': {'content': '星が光る。 Вот перевод.'}}
+        result = self.llm.generate_idle_chatter(singing=True, language='Japanese')
+        self.assertEqual(result, '[singing] 星が光る。')
+        self.assertIn('только японский', self.client.chat.call_args.kwargs['messages'][0]['content'])
+        self.llm.update_reply_language('a', 'Ари, спой на японском')
+        self.assertEqual(self.llm.get_reply_language('a'), 'Japanese')
 
     def test_idle_song_has_hidden_singing_style_and_no_tool_call(self):
         self.client.chat.return_value = {'message': {'content':

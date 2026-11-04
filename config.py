@@ -51,9 +51,9 @@ OLLAMA_NUM_THREAD = int(os.getenv("OLLAMA_NUM_THREAD", "12"))
 # вместе с весами, и Ollama выгружает большую часть слоёв на CPU — это и есть
 # основная причина зависаний/долгих ответов. Голосовому боту с короткой
 # историей (SHORT_HISTORY_LEN) хватает несколько тысяч токенов с запасом.
-OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "256"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "512"))
 LLM_THINK = os.getenv("LLM_THINK", "true").lower() in {"1", "true", "yes", "on"}
 # Если Ollama не отвечает дольше этого — считаем запрос зависшим (сеть/GPU-память
 # и т.п.) и обрываем его, а не ждём вечно.
