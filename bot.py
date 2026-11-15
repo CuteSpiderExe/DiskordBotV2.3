@@ -57,7 +57,7 @@ conversation_languages: dict[int, str] = {}
 # guild_id -> фоновая задача, которая болтает, если в канале долго тишина
 idle_tasks: dict[int, asyncio.Task] = {}
 # guild_id-и, для которых прямо сейчас идёт подключение (защита от гонки
-# при одновременном ari!join и авто-входе/переподключении после кика)
+# при одновременных командах ari!join)
 _joining_guilds: set[int] = set()
 
 
@@ -138,50 +138,7 @@ async def on_ready():
 
         asyncio.create_task(_warmup())
 
-        # on_voice_state_update реагирует только на будущие события захода в
-        # канал — если люди уже сидели в голосовом до (пере)запуска бота, без
-        # этого он не подключится сам, пока кто-то не выйдет и не зайдёт заново.
-        for guild in bot.guilds:
-            if guild.voice_client is not None:
-                continue
-            # channel.members требует кэш участников сервера (Members Intent),
-            # которого у нас нет и не должно быть для такого бота — из-за
-            # этого сразу после (пере)запуска кэш почти пуст, и
-            # channel.members ложно выглядит пустым, даже если люди реально
-            # сидят в канале. channel.voice_states — низкий уровень специально
-            # для этого случая: строится из voice-состояний (voice_states
-            # intent, он есть), не из кэша участников.
-            occupied = [
-                channel
-                for channel in guild.voice_channels
-                if channel != guild.afk_channel
-                and any(uid != bot.user.id for uid in channel.voice_states)
-            ]
-            ghost_channel = next(
-                (c for c in guild.voice_channels if bot.user.id in c.voice_states), None
-            )
-            if ghost_channel is not None:
-                print(f"[voice] Висит призраком в {ghost_channel.name} после сбоя — переподключаюсь туда же.")
-                try:
-                    await _join_channel(guild, ghost_channel, announce=False)
-                except Exception as e:
-                    print(f"[voice] Не удалось переподключиться в {ghost_channel.name}: {e}")
-            elif len(occupied) == 1:
-                channel = occupied[0]
-                print(f"[voice] В {channel.name} уже кто-то есть — захожу сама.")
-                try:
-                    # Это (пере)запуск процесса, а не событие в разговоре —
-                    # никто её не звал, поэтому здесь всегда тихий вход.
-                    await _join_channel(guild, channel, announce=False)
-                except Exception as e:
-                    print(f"[voice] Не удалось самостоятельно зайти в канал: {e}")
-            elif len(occupied) > 1:
-                # Люди сидят сразу в нескольких каналах, и её самой нигде нет
-                # (иначе сработала бы ветка выше) — непонятно, к кому идти, а
-                # угадывать (брать просто первый по списку) значит с той же
-                # вероятностью прийти не туда. Ждём явного ari!join.
-                names = ", ".join(c.name for c in occupied)
-                print(f"[voice] Люди сразу в нескольких каналах ({names}) — не угадываю, жду ari!join.")
+        print("[voice] Вход в голосовой канал только по команде ari!join.")
 
 
 @bot.event
@@ -449,13 +406,7 @@ def _make_sink(guild: discord.Guild) -> VoiceSink:
 async def _join_channel(
     guild: discord.Guild, channel: discord.VoiceChannel, kicked: bool = False, announce: bool = True
 ):
-    """Общий вход в канал: используется и командой ari!join, и авто-входом,
-    когда кто-то заходит в канал, и переподключением после кика.
-
-    announce=False — тихий вход без реплики: используется, когда мы сами
-    переподключаемся после технического сбоя процесса —
-    это не событие в разговоре, никто её не звал и не выгонял, озвучивать
-    нечего."""
+    """Вход в голосовой канал по явной команде ari!join."""
     if guild.id in _joining_guilds:
         return
     _joining_guilds.add(guild.id)
@@ -522,42 +473,18 @@ async def _join_channel(
 async def on_voice_state_update(
     member: discord.Member, before: discord.VoiceState, after: discord.VoiceState
 ):
-    guild = member.guild
-
-    if member.id == bot.user.id:
-        # Бота выкинули из канала не через ari!leave — похоже на кик посреди
-        # разговора. Сама переподключается и возмущается.
-        if before.channel is not None and after.channel is None and voice_sessions.get(guild.id):
-            print(f"[voice] Отключили из {before.channel.name} без ari!leave — переподключаюсь.")
-            voice_sessions[guild.id] = False
-            idle_task = idle_tasks.pop(guild.id, None)
-            if idle_task:
-                idle_task.cancel()
-            speaker = speakers.pop(guild.id, None)
-            if speaker:
-                await speaker.close()
-            await asyncio.sleep(1.5)
-            try:
-                await _join_channel(guild, before.channel, kicked=True)
-            except Exception as e:
-                print(f"[voice] Не удалось переподключиться после кика: {e}")
+    if member.id != bot.user.id or before.channel is None or after.channel is not None:
         return
-
-    if member.bot:
-        return
-
-    # Живой человек зашёл в новый голосовой канал — заходим сами, если нас
-    # ещё нигде нет в этой гильдии.
-    if after.channel is not None and after.channel != before.channel:
-        if after.channel == guild.afk_channel:
-            return
-        if guild.voice_client is not None or guild.id in _joining_guilds:
-            return
-        print(f"[voice] {member.display_name} зашёл в {after.channel.name} — захожу сама.")
-        try:
-            await _join_channel(guild, after.channel)
-        except Exception as e:
-            print(f"[voice] Не удалось самостоятельно зайти в канал: {e}")
+    guild_id = member.guild.id
+    voice_sessions[guild_id] = False
+    pending_utterances.pop(guild_id, None)
+    idle_task = idle_tasks.pop(guild_id, None)
+    if idle_task:
+        idle_task.cancel()
+    speaker = speakers.pop(guild_id, None)
+    if speaker:
+        await speaker.close()
+    print("[voice] Отключена от канала. Для входа используй ari!join.")
 
 
 # ---------- Команды ----------

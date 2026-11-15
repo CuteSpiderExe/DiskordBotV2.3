@@ -24,6 +24,25 @@ def module(name, path):
 
 
 class MemoryTests(unittest.TestCase):
+    def test_japanese_numeric_answer_is_preserved(self):
+        self.llm.set_reply_language('a', 'Japanese')
+        self.client.chat.return_value = iter([{'message': {'content': '4'}, 'done_reason': 'stop'}])
+        with patch.object(self.llm, 'compress_history'):
+            answer = list(self.llm.stream_sentences('a', 'Сколько будет 2 плюс 2?'))
+        self.assertEqual(answer, ['4です。'])
+        self.assertEqual(self.client.chat.call_count, 1)
+
+    def test_wrong_language_retries_original_question_without_tools(self):
+        self.llm.set_reply_language('a', 'Japanese')
+        self.client.chat.side_effect = [
+            iter([{'message': {'content': 'Ответ четыре.'}, 'done_reason': 'stop'}]),
+            iter([{'message': {'content': '4です。'}, 'done_reason': 'stop'}])]
+        with patch.object(self.llm, 'compress_history'):
+            answer = list(self.llm.stream_sentences('a', 'Сколько будет 2 плюс 2?'))
+        self.assertEqual(answer, ['4です。'])
+        self.assertEqual(self.client.chat.call_args.kwargs['messages'][-1]['content'], 'Сколько будет 2 плюс 2?')
+        self.assertEqual(self.client.chat.call_args.kwargs['tools'], [])
+
     def test_emotions_bypass_llm_in_both_languages(self):
         commands = {'посмейся': 'amused', 'вздохни': 'sigh', 'пошепчи': 'whisper',
                     'порадуйся': 'excited', 'погрусти': 'sad', 'говори обычно': 'normal'}

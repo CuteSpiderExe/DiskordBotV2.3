@@ -32,6 +32,8 @@ def prepare_voice_answer(key: str, text: str) -> str:
     if not text.strip():
         return ""
     if _reply_languages.get(key) == "Japanese":
+        if re.fullmatch(r"[\d\s+−\-×*/÷=.,%!?]+", text.strip()):
+            return text.strip().rstrip('.!?') + "です。"
         return japanese_only(text) or "すみません。もう一度お願いします。"
     return text
 
@@ -164,7 +166,15 @@ def _opts(**extra) -> dict:
 def _system_prompt(key: str, voice: bool, status: str = "", name: str = "") -> str:
     if name:
         memory.set_name(key, name)
-    system = PERSONA + (VOICE_SUFFIX if voice else "") + TOOLS_REMINDER + FOCUS_REMINDER + FACTS_REMINDER
+    persona = PERSONA
+    if voice and get_reply_language(key) == "Japanese":
+        persona = (
+            "あなたはDiscordの女性AIキャラクター、アリです。親しみやすく、少し茶目っ気があります。"
+            "ユーザーはロシア語で話しますが、あなたは必ず日本語だけで答えます。"
+            "質問に直接、一つか二つの短い文で答えてください。翻訳、読み方、他の言語、"
+            "余計な説明、質問返しは不要です。計算には計算結果だけを答えてください。"
+            "数字だけでなく「4です。」のように日本語の文にしてください。")
+    system = persona + (VOICE_SUFFIX if voice else "") + TOOLS_REMINDER + FOCUS_REMINDER + FACTS_REMINDER
     if voice:
         language = _reply_languages.get(key, "Russian")
         system += ("\nЯзык ответа: японский. Собеседник говорит по-русски: понимай его русский "
@@ -406,6 +416,11 @@ def _stream_sentences(
     messages = [
         {"role": "system", "content": _system_prompt(key, True, status, name)}
     ] + memory.entry(key)["recent"]
+    if get_reply_language(key) == "Japanese":
+        # Old Russian/verbose assistant turns teach the model the wrong format.
+        messages = [messages[0]] + [m for m in messages[1:]
+            if m['role'] != 'assistant' or (not re.search(r'[А-Яа-яЁё]', m['content'])
+                and len(m['content']) <= 160)]
     if translation:
         # Translation needs neither character instructions nor Discord tools.
         # Including old verbose replies encourages the model to imitate them.
@@ -415,6 +430,19 @@ def _stream_sentences(
     try:
         for _ in range(discord_tools.MAX_TOOL_ROUNDS):
             stream = _complete_voice_chunks(messages, translation=translation)
+            if get_reply_language(key) == "Japanese" and not any(
+                    c.get('message', {}).get('tool_calls') for c in stream):
+                raw = _sanitize(''.join(c.get('message', {}).get('content', '') for c in stream))
+                numeric = bool(re.fullmatch(r'[\d\s+−\-×*/÷=.,%!?]+', raw))
+                if raw and not japanese_only(raw) and not numeric:
+                    print('[llm language] Ответ без японского текста; повторяю ответ на исходный вопрос.')
+                    repair = [
+                        {'role': 'system', 'content': 'ユーザーの質問に日本語だけで短く答えてください。翻訳や説明は不要です。数字の答えは「4です。」のように書いてください。'},
+                        {'role': 'user', 'content': user_text}]
+                    stream = _complete_voice_chunks(repair, translation=True)
+                    raw = _sanitize(''.join(c.get('message', {}).get('content', '') for c in stream))
+                answer = prepare_voice_answer(key, raw)
+                stream = [{'message': {'content': answer}}]
 
             buffer = ""
             round_answer = ""
